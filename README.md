@@ -58,6 +58,11 @@ print(res.recalled[:10], res.context[:200])
 4. **锚段打分**：问题与候选段的逐位置余弦相似度低于 `0.4` 记 0；对每个查询 token 在候选段上取最大值，再在查询侧取最大正连续子段和；候选侧另乘长度门 `min(1, 字符数/5)`。
 5. **生成奖励**：问答阶段按解码注意力质量取 `25%` 分位为切点，质量不低于切点的召回段记为奖励，其余记为惩罚：被奖励的本块段之间、问题槽到载体、问题槽到被奖励段之间新建侧向边；已有边按「质量 − 切点」调制。
 
+## 评测
+
+InfiniteBench:
+![召回臂与完整上下文臂的准确率](assets/Infinitebench_zh.png)
+
 ## API
 
 ### `Synaptica(memory, backend, cfg=None, seed=0)`
@@ -122,7 +127,13 @@ print(res.recalled[:10], res.context[:200])
 
 ### 后端
 
-`QwenBackend(model_path, *, device=None, dtype=torch.bfloat16, lazy=False, attn_implementation=None, device_map=None, max_memory=None, expand_kv_in_generate=None, load_in_8bit=False)` 实现了上述契约。接入其他模型时实现同名方法即可，两条硬性约束：`truncated_hidden_attn` 必须返回该层在纯输入序列上的段级注意力图；`generate_ids` 必须支持 `prompts_are_ids=True`。
+`QwenBackend(model_path, *, device=None, dtype=torch.bfloat16, lazy=False, attn_implementation=None, device_map=None, max_memory=None, expand_kv_in_generate=None, load_in_8bit=False)`
+该后端为 Qwen3.5 架构设计，实现了上述契约。接入其他模型时实现同名方法即可，需求：
+
+1. `truncated_hidden_attn` 必须返回该层在纯输入序列上的段级注意力图
+2. `generate_ids` 必须支持 `prompts_are_ids=True`。
+
+我们非常欢迎开源社区为我们提供其他模型架构的后端！
 
 ## 目录
 

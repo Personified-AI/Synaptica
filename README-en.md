@@ -58,6 +58,11 @@ print(res.recalled[:10], res.context[:200])
 4. **Anchor scoring**: per-position cosine similarity between question and candidate segments below `0.4` is set to 0; the maximum over candidates is taken for each query token, then the maximum positive contiguous run is taken on the query side; the candidate side is additionally scaled by the length gate `min(1, chars/5)`.
 5. **Generation reward**: during question answering the decode attention mass is cut at its `25%` quantile; recalled segments at or above the cut count as rewarded and the rest as penalized: new lateral edges are created between rewarded segments of the current block, from question slots to carriers, and from question slots to rewarded segments; existing edges are modulated by `mass − cut`.
 
+## Benchmarks
+
+InfiniteBench:
+![Accuracy of the retrieval and full-context arms](assets/Infinitebench_en.png)
+
 ## API
 
 ### `Synaptica(memory, backend, cfg=None, seed=0)`
@@ -122,7 +127,13 @@ All arguments are keyword arguments.
 
 ### Backend
 
-`QwenBackend(model_path, *, device=None, dtype=torch.bfloat16, lazy=False, attn_implementation=None, device_map=None, max_memory=None, expand_kv_in_generate=None, load_in_8bit=False)` implements that contract. To plug in another model, implement the same methods; two constraints are hard: `truncated_hidden_attn` must return the segment-level attention graph of that layer over the plain input sequence, and `generate_ids` must accept `prompts_are_ids=True`.
+`QwenBackend(model_path, *, device=None, dtype=torch.bfloat16, lazy=False, attn_implementation=None, device_map=None, max_memory=None, expand_kv_in_generate=None, load_in_8bit=False)`
+This backend is designed for the Qwen 3.5 architecture and implements the above contract. When integrating other models, simply implement methods with the same names. Requirements:
+
+1. `truncated_hidden_attn` must return the segment-level attention map for that layer on the raw input sequence.
+2. `generate_ids` must support `prompts_are_ids=True`.
+
+We warmly welcome the open-source community to provide backends for other model architectures!
 
 ## Layout
 
