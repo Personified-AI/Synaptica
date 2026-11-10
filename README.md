@@ -133,7 +133,7 @@ InfiniteBench:
 1. `truncated_hidden_attn` 必须返回该层在纯输入序列上的段级注意力图
 2. `generate_ids` 必须支持 `prompts_are_ids=True`。
 
-我们非常欢迎开源社区为我们提供其他模型架构的后端！
+我们非常欢迎开源社区为本项目贡献其他模型架构的后端！
 
 ## 目录
 

@@ -137,7 +137,7 @@ This backend is designed for the Qwen 3.5 architecture and implements the above 
 1. `truncated_hidden_attn` must return the segment-level attention map for that layer on the raw input sequence.
 2. `generate_ids` must support `prompts_are_ids=True`.
 
-We warmly welcome the open-source community to provide backends for other model architectures!
+We would very much welcome contributions from the open-source community to develop back-ends based on other model architectures for this project!
 
 ## Layout
 
