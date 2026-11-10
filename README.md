@@ -11,7 +11,7 @@
 
 ## 快速上手
 
-依赖 PyTorch 2.x、`transformers>=4.56`（Qwen3.5 需要 5.x），以及一个能返回中间层隐状态的 Hugging Face 因果语言模型。把 `package/` 加入 `PYTHONPATH` 后按 `session`、`snn.memory`、`ann.llm.backend` 导入；若以仓库根为路径，则按 `package.session` 导入。
+依赖 PyTorch 2.x、`transformers>=4.56`（Qwen3.5 需要 5.x），以及一个具有 Full Attention 层的 Hugging Face 因果语言模型。
 
 ```bash
 pip install -r requirements.txt

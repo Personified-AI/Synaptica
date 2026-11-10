@@ -11,7 +11,7 @@ Providing an associative long-term memory and context expansion system for LLMs,
 
 ## Quick Start
 
-Requires PyTorch 2.x, `transformers>=4.56` (5.x for Qwen3.5), and a Hugging Face causal language model that returns the hidden states of an intermediate layer. Add `package/` to `PYTHONPATH` and import from `session`, `snn.memory` and `ann.llm.backend`; with the repository root on the path, import from `package.session` instead.
+It relies on PyTorch 2.x, `transformers>=4.56` (Qwen3.5 requires 5.x), and a Hugging Face causal language model with full attention layers.
 
 ```bash
 pip install -r requirements.txt
