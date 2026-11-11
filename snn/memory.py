@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+from array import array
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
@@ -12,6 +13,25 @@ from .node import LateralConfig, LateralState, SynapticaNode
 from .store import SegmentStore, as_token_ids
 
 __all__ = ["RecallResult", "WriteStats", "PatternPrep", "SynapticaMemory"]
+
+_BIT_W = (1, 2, 4, 8, 16, 32, 64, 128)
+
+
+def _pack_bits(bits: Tensor) -> Tensor:
+    b = bits.to(torch.int64).reshape(-1)
+    pad = (-int(b.numel())) % 8
+    if pad:
+        b = torch.cat([b, torch.zeros(pad, dtype=torch.int64)])
+    b = b.reshape(-1, 8)
+    w = torch.tensor(_BIT_W, dtype=torch.int64)
+    return (b * w).sum(dim=1).to(torch.uint8)
+
+
+def _unpack_bits(packed: Tensor, n: int) -> Tensor:
+    col = packed.to(torch.int64).reshape(-1, 1)
+    shifts = torch.arange(8, dtype=torch.int64)
+    out = ((col >> shifts) & 1).reshape(-1)[: int(n)]
+    return out.to(torch.float32)
 
 class PatternPrep:
 
@@ -75,7 +95,7 @@ class SynapticaMemory:
 
         self.node.attach_lateral(cfg=self.lateral_cfg)
 
-        self._pattern_index: Dict[str, int] = {}
+        self._pattern_index: Dict[int, int] = {}
 
         self.n_pattern_hits: int = 0
 
@@ -90,9 +110,7 @@ class SynapticaMemory:
 
         self._token_dims: int = 0
 
-        self._pattern_cache: Dict[int, Tuple[Tuple[int, ...], Tensor]] = {}
-
-        self._tokens_cache: Dict[int, Tuple[Tuple[int, ...], Tensor]] = {}
+        self._pattern_cache: Dict[int, Tuple[Tuple[int, ...], Any, float, int, Any]] = {}
 
         self.segment_encoder: Optional[Any] = None
 
@@ -323,7 +341,10 @@ class SynapticaMemory:
         if int(state["input_size"]) != int(self.input_size):
             raise ValueError(f"input_size 不一致：存档 {state['input_size']} vs 当前 {self.input_size}")
         dev = torch.device(device) if device is not None else self.node.mem.device
-        self.payloads = {int(k): v for k, v in state["payloads"].items()}
+        self.payloads = {
+            int(k): array("i", (int(x) for x in v))
+            for k, v in state["payloads"].items()
+        }
 
         self._cache_order = sorted(self.payloads)
         self.embedding_dim = int(state["embedding_dim"])
@@ -350,7 +371,6 @@ class SynapticaMemory:
 
         if index is not None:
             self._pattern_cache.pop(int(index), None)
-            self._tokens_cache.pop(int(index), None)
         idx = self.store_payload_only(payload, index)
         ids = self.segment_token_ids(idx) or []
         if ids:
@@ -389,7 +409,7 @@ class SynapticaMemory:
 
                 return int(_hit)
             index = self._next_free_slot()
-        self.payloads[index] = tuple(ids)
+        self.payloads[index] = array("i", (int(x) for x in ids))
         self._touch_cache(index)
         if _new_pattern is not None:
             self.index_pattern(_new_pattern, int(index))
@@ -442,10 +462,6 @@ class SynapticaMemory:
         k = self.token_dims
         if k <= 0:
             raise RuntimeError("token_dims 未确定：注入编码器时须先建立段长与模式维度的整除关系")
-        _ids_key = tuple(int(x) for x in ids)
-        _hit = self._tokens_cache.get(int(slot))
-        if _hit is not None and _hit[0] == _ids_key:
-            return _hit[1]
         pat = self._cached_pattern(slot, ids)
         if pat is None:
             pat = self._encode(ids)[1]
@@ -457,23 +473,35 @@ class SynapticaMemory:
                 f"从模式取 {n_tok} 个 token 的特征需要 {need} 维，"
                 f"模式只有 {int(pat.numel())} 维"
             )
-        out = pat[:need].reshape(n_tok, int(k))
-        self._tokens_cache[int(slot)] = (_ids_key, out)
-        return out
+        return pat[:need].reshape(n_tok, int(k))
 
     def _cached_pattern(self, slot: int, ids: Sequence[int]) -> Optional[Tensor]:
         hit = self._pattern_cache.get(int(slot))
         if hit is None:
             return None
-        fp, pat = hit
+        fp, packed, scale, n, dense = hit
         if tuple(int(x) for x in ids) != fp:
             return None
-        return pat
+        if dense is not None:
+            return dense
+        return _unpack_bits(packed, n) / scale
 
     def _remember_pattern(self, slot: int, ids: Sequence[int], pattern: Tensor) -> None:
+        dense = pattern.detach().to("cpu").float().reshape(-1).clone()
+        n = int(dense.numel())
+        bits = dense != 0
+        scale = float(bits.sum().item())
+        if scale < 1.0:
+            scale = 1.0
+        packed = _pack_bits(bits)
+        recon = _unpack_bits(packed, n) / scale
+        keep = None if torch.equal(recon, dense) else dense
         self._pattern_cache[int(slot)] = (
             tuple(int(x) for x in ids),
-            pattern.detach().to("cpu").float().reshape(-1).clone(),
+            packed,
+            scale,
+            n,
+            keep,
         )
     @property
     def token_dims(self) -> int:
@@ -551,7 +579,7 @@ class SynapticaMemory:
         if p is None and self.segment_store is not None:
             got = self.segment_store.read(s)
             if got is not None:
-                self.payloads[s] = tuple(got)
+                self.payloads[s] = array("i", (int(x) for x in got))
                 self._touch_cache(s)
                 p = self.payloads[s]
         if p is None:
@@ -571,11 +599,11 @@ class SynapticaMemory:
         return pat
 
     @staticmethod
-    def pattern_key(pat) -> str:
+    def pattern_key(pat) -> int:
         import hashlib
 
         t = pat.detach().to("cpu", torch.float32).contiguous()
-        return hashlib.md5(t.numpy().tobytes()).hexdigest()
+        return int.from_bytes(hashlib.md5(t.numpy().tobytes()).digest()[:8], "little")
 
     def find_by_pattern(self, pat) -> Optional[int]:
         key = self.pattern_key(pat)
