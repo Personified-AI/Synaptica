@@ -657,15 +657,7 @@ class SynapticaNode:
         self,
         input_size: int,
         output_size: int,
-        lr: float = 0.01,
         *,
-        trace_decay: float = 0.95,
-        eligibility_decay: float = 0.9,
-        beta: float = 0.9,
-        threshold: float = 1.0,
-        weight_init: float = 0.3,
-        max_weight: float = 1.0,
-        seed: Optional[int] = None,
         dtype: torch.dtype = torch.float32,
         device: Optional[Union[str, torch.device]] = None,
     ) -> None:
@@ -673,34 +665,11 @@ class SynapticaNode:
             raise ValueError(f"input_size 必须是正整数，收到 {input_size}")
         if int(output_size) <= 0:
             raise ValueError(f"output_size 必须是正整数，收到 {output_size}")
-        if not 0.0 <= float(trace_decay) <= 1.0:
-            raise ValueError(f"trace_decay 必须在 [0, 1]，收到 {trace_decay}")
-        if not 0.0 <= float(eligibility_decay) <= 1.0:
-            raise ValueError(f"eligibility_decay 必须在 [0, 1]，收到 {eligibility_decay}")
-        if float(weight_init) < 0.0:
-            raise ValueError(f"weight_init 不能为负，收到 {weight_init}")
-        if float(max_weight) <= 0.0:
-            raise ValueError(f"max_weight 必须为正，收到 {max_weight}")
 
         self.input_size = int(input_size)
         self.output_size = int(output_size)
-        self.lr = float(lr)
-        self.trace_decay = float(trace_decay)
-        self.eligibility_decay = float(eligibility_decay)
-        self.beta = float(beta)
-        self.threshold = float(threshold)
-        self.weight_init = float(weight_init)
-        self.max_weight = float(max_weight)
-        self._seed = None if seed is None else int(seed)
 
-        _u = self._uniform(self.output_size)
-        self.weight: torch.Tensor = ((_u - 0.5) * self.weight_init).to(
-            dtype=dtype, device=device
-        )
-
-        self.mem = torch.zeros(
-            self.output_size, dtype=self.weight.dtype, device=self.weight.device
-        )
+        self.mem = torch.zeros(self.output_size, dtype=dtype, device=device)
 
         self.lateral: Optional["LateralState"] = None
 
@@ -711,17 +680,17 @@ class SynapticaNode:
     ) -> "LateralState":
         if lateral is None:
             lateral = LateralState(
-                torch.zeros(2, 0, dtype=torch.long, device=self.weight.device),
-                torch.zeros(0, device=self.weight.device),
+                torch.zeros(2, 0, dtype=torch.long, device=self.mem.device),
+                torch.zeros(0, device=self.mem.device),
                 cfg,
                 node=self,
             )
         else:
             lateral.node = self
-            if lateral.device != self.weight.device:
-                lateral.index = lateral.index.to(self.weight.device)
-                lateral.values = lateral.values.to(self.weight.device)
-                lateral.device = self.weight.device
+            if lateral.device != self.mem.device:
+                lateral.index = lateral.index.to(self.mem.device)
+                lateral.values = lateral.values.to(self.mem.device)
+                lateral.device = self.mem.device
         self.lateral = lateral
         return lateral
 
@@ -729,14 +698,6 @@ class SynapticaNode:
         return {
             "input_size": int(self.input_size),
             "output_size": int(self.output_size),
-            "lr": float(self.lr),
-            "trace_decay": float(self.trace_decay),
-            "eligibility_decay": float(self.eligibility_decay),
-            "beta": float(self.beta),
-            "threshold": float(self.threshold),
-            "weight_init": float(self.weight_init),
-            "max_weight": float(self.max_weight),
-            "weight": self.weight.detach().cpu(),
             "lateral": (
                 self.lateral.state_dict() if self.lateral is not None else None
             ),
@@ -748,14 +709,9 @@ class SynapticaNode:
         *,
         device: Optional[Union[str, torch.device]] = None,
     ) -> "SynapticaNode":
-        dev = torch.device(device) if device is not None else self.weight.device
         n_out = int(state["output_size"])
         if n_out != int(self.output_size):
             self.grow(n_out)
-        w = state["weight"]
-        if w.shape != self.weight.shape:
-            raise ValueError(f"权重形状不符：存档 {tuple(w.shape)} vs 当前 {tuple(self.weight.shape)}")
-        self.weight.copy_(w.to(self.weight.device))
         self.lateral = None
         lat_state = state.get("lateral")
         if lat_state is not None:
@@ -769,23 +725,11 @@ class SynapticaNode:
             f"l_edges={n_lat})"
         )
 
-    def _uniform(self, rows: int) -> torch.Tensor:
-        gen = None
-        if self._seed is not None:
-            gen = torch.Generator(device="cpu").manual_seed(self._seed)
-        return torch.rand(rows, self.input_size, generator=gen, dtype=torch.float32)
-
     def grow(self, new_size: int) -> bool:
         new_size = int(new_size)
         if new_size <= self.output_size:
             return False
         n_new = new_size - self.output_size
-        w_all = self._uniform(new_size)
-        w = ((w_all[self.output_size :] - 0.5) * self.weight_init).to(
-            dtype=self.weight.dtype, device=self.weight.device
-        )
-        del w_all
-        self.weight = torch.cat([self.weight, w], dim=0)
         self.mem = torch.cat(
             [self.mem, torch.zeros(n_new, dtype=self.mem.dtype, device=self.mem.device)]
         )

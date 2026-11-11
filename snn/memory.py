@@ -35,7 +35,6 @@ class WriteStats:
     repeats: int
     eligibility_norm: float
     delta_abs_mean: float
-    weight_mean: float
     skipped: bool = False
 
     def as_dict(self) -> dict:
@@ -48,13 +47,6 @@ class SynapticaMemory:
         input_size: int,
         num_slots: int,
         *,
-        lr: float = 0.05,
-        seed: int = 0,
-        weight_init: float = 0.3,
-        max_weight: float = 1.0,
-        trace_decay: float = 0.95,
-        eligibility_decay: float = 0.9,
-        teacher_amplitude: float = 5.0,
         device: Optional[Union[str, torch.device]] = None,
         lateral_cfg: Optional[LateralConfig] = None,
         store: Optional[SegmentStore] = None,
@@ -66,7 +58,6 @@ class SynapticaMemory:
             raise ValueError(f"num_slots 必须是正整数，收到 {num_slots}")
         self.input_size = int(input_size)
         self.num_slots = int(num_slots)
-        self.teacher_amplitude = float(teacher_amplitude)
         self.prepare = PatternPrep()
 
         self.lateral_cfg = lateral_cfg or LateralConfig()
@@ -79,12 +70,6 @@ class SynapticaMemory:
         self.node = SynapticaNode(
             input_size=self.input_size,
             output_size=self.num_slots,
-            lr=float(lr),
-            trace_decay=float(trace_decay),
-            eligibility_decay=float(eligibility_decay),
-            weight_init=float(weight_init),
-            max_weight=float(max_weight),
-            seed=int(seed),
             device=device,
         )
 
@@ -147,7 +132,7 @@ class SynapticaMemory:
         if _cached is not None and int(_ver) == int(self._state_version):
             return _cached.clone()
         m = torch.zeros(
-            self.num_slots, dtype=torch.bool, device=self.node.weight.device
+            self.num_slots, dtype=torch.bool, device=self.node.mem.device
         )
         keys = self.stored_slots()
         if keys:
@@ -309,7 +294,6 @@ class SynapticaMemory:
         return {
             "input_size": int(self.input_size),
             "num_slots": int(self.num_slots),
-            "teacher_amplitude": float(self.teacher_amplitude),
 
             "payloads": {
                 int(s): tuple(self.segment_token_ids(s) or [])
@@ -338,8 +322,7 @@ class SynapticaMemory:
     ) -> "SynapticaMemory":
         if int(state["input_size"]) != int(self.input_size):
             raise ValueError(f"input_size 不一致：存档 {state['input_size']} vs 当前 {self.input_size}")
-        dev = torch.device(device) if device is not None else self.node.weight.device
-        self.teacher_amplitude = float(state["teacher_amplitude"])
+        dev = torch.device(device) if device is not None else self.node.mem.device
         self.payloads = {int(k): v for k, v in state["payloads"].items()}
 
         self._cache_order = sorted(self.payloads)
@@ -445,7 +428,7 @@ class SynapticaMemory:
             raise ValueError(f"encoder 对 {n} 个 token 返回了空模式")
         if self.pattern_len and int(pat.numel()) != int(self.pattern_len):
             raise ValueError(f"模式长度 {int(pat.numel())} 与已记录的 {int(self.pattern_len)} 不一致")
-        dev = self.node.weight.device
+        dev = self.node.mem.device
         if int(self.embedding_dim) and base.numel() != int(self.embedding_dim):
             raise ValueError(f"段级表示维度 {base.numel()} 与已记录的 {int(self.embedding_dim)} 不一致")
         self.pattern_len = int(pat.numel())
@@ -887,42 +870,11 @@ class SynapticaMemory:
         }
         return out
 
-    def teacher(self, index: int) -> Tensor:
-        current = torch.zeros(
-            self.node.output_size,
-            dtype=self.node.weight.dtype,
-            device=self.node.weight.device,
-        )
-        current[int(index)] = self.teacher_amplitude
-        return current
-
     @torch.no_grad()
-    def write(
-        self, pattern: Tensor, index: int, *, reward: float = 1.0, repeats: int = 1
-    ) -> WriteStats:
-        idx = int(index)
-        if not 0 <= idx < self.num_slots:
-            raise ValueError(f"槽号必须在 [0, {self.num_slots})，收到 {idx}")
-        n = self.write_batch([pattern], [idx], reward=reward, repeats=repeats)
-        w_mean = float(self.node.weight.mean())
-        return WriteStats(
-            index=idx,
-            reward=float(reward),
-            repeats=int(repeats),
-            eligibility_norm=0.0,
-            delta_abs_mean=0.0,
-            weight_mean=w_mean,
-            skipped=(n == 0),
-        )
-
-    @torch.no_grad()
-    def write_batch(
+    def remember_slot_patterns(
         self,
         patterns: Sequence[Tensor],
         indices: Sequence[int],
-        *,
-        reward: float = 1.0,
-        repeats: int = 1,
     ) -> int:
         idx = [int(i) for i in indices]
         if not idx:
@@ -931,22 +883,11 @@ class SynapticaMemory:
             raise ValueError(f"patterns 与 indices 长度不一致：{len(patterns)} vs {len(idx)}")
         if max(idx) >= self.num_slots:
             self.ensure_slots(max(idx) + 1)
-        reps = max(1, int(repeats))
-        if abs(float(reward)) == 0.0:
-            return 0
-        pats = torch.stack([self.prepare(p) for p in patterns], dim=0)
-
+        pats = [self.prepare(p) for p in patterns]
         for _i, _sl in enumerate(idx):
             _ids = self.segment_token_ids(_sl) or []
             if _ids:
                 self._remember_pattern(_sl, _ids, pats[_i])
-        pats = pats.to(self.node.weight.device).to(self.node.weight.dtype)
-        eff = float(self.node.trace_decay) * float(reps) * pats
-        dw = (float(self.node.lr) * float(reward)) * eff
-        tgt = torch.tensor(idx, dtype=torch.long, device=self.node.weight.device)
-        self.node.weight[tgt] = (self.node.weight[tgt] + dw).clamp(
-            -self.node.max_weight, self.node.max_weight
-        )
         self.node.reset()
 
         self._bump()
@@ -975,8 +916,8 @@ class SynapticaMemory:
 
         self.node.mem = torch.zeros_like(self.node.mem)
         num = self.node.output_size
-        dev = self.node.weight.device
-        seen = torch.zeros(num, dtype=self.node.weight.dtype, device=dev)
+        dev = self.node.mem.device
+        seen = torch.zeros(num, dtype=self.node.mem.dtype, device=dev)
         out = torch.zeros_like(seen)
         s_prev = torch.zeros_like(seen)
 
@@ -1041,7 +982,7 @@ class SynapticaMemory:
             if slot_gain is not None:
                 _thr_vec = _thr_vec / _gain
 
-            spk = (mem > _thr_vec).to(self.node.weight.dtype) * _thr_vec
+            spk = (mem > _thr_vec).to(self.node.mem.dtype) * _thr_vec
             if int(t) == 0:
 
                 spk[idx] = 1.0

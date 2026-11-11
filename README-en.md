@@ -11,7 +11,7 @@ Providing an associative long-term memory and context expansion system for LLMs,
 
 ## Quick Start
 
-It relies on PyTorch 2.x, `transformers>=4.56` (Qwen3.5 requires 5.x), and a Hugging Face causal language model with full attention layers.
+Requires PyTorch 2.x, `transformers>=4.56` (5.x for Qwen3.5), and a Hugging Face causal language model that returns the hidden states of an intermediate layer. Add `package/` to `PYTHONPATH` and import from `session`, `snn.memory` and `ann.llm.backend`; with the repository root on the path, import from `package.session` instead.
 
 ```bash
 pip install -r requirements.txt
@@ -30,7 +30,7 @@ cfg = SynapticaConfig(
     attn_block=256,
 )
 backend = QwenBackend("/path/to/Qwen3.5-9B", device="cuda:0")
-memory = SynapticaMemory(input_size=cfg.num_neurons, num_slots=1, seed=0)
+memory = SynapticaMemory(input_size=cfg.num_neurons, num_slots=1)
 bot = Synaptica(memory=memory, backend=backend, cfg=cfg, seed=0)
 
 with open("long_document.txt", encoding="utf-8") as f:
@@ -52,15 +52,11 @@ print(res.recalled[:10], res.context[:200])
 
 ![Synaptica workflow](assets/workflow-en.png)
 
-1. **Segment-level attention map**: For the forward pass of each writing block, take the attention from layer `layer` and aggregate it by segment; after removing positional bias, retain the `TopK` targets in each row, and constrain both the number of outgoing and incoming edges per target to maintain sparsity and efficiency. Perform mirror edge supplementation for each target; then, for each attender, take the target with the largest weight in its row and create negative edges from it to the remaining targets in that row, with weights computed according to the relative drop within the row, and with the absolute edge weight capped at `2.0`.
-
-2. **Spike encoding**: The embedding of each token within a segment is dimensionality-reduced via a fixed random projection; for each token, take `top-8` and binarize to 0/1, then concatenate in token order to form the segment pattern.
-
-3. **Spike recall**: Question tokens are encoded as spike vectors and propagated along lateral edges for a certain number of steps. The membrane potential is updated as `mem_t = 0.5·mem_{t-1} + L·s_{t-1}`; the firing threshold is `0.7×clamp(ref/u)`, where `u` is the attention mass of that slot and `ref` is the median positive mass of written slots. The firing amplitude equals the threshold, and a hard refractory period follows firing. Fired segments serve as carriers and are expanded after sorting by anchor-segment score.
-
-4. **Anchor-segment scoring**: Perform position-wise cosine similarity between the question and candidate segments, and set weak similarities to zero. For each query token, take the maximum over the candidate segment; then take the maximum positive contiguous subarray sum on the query side, and additionally multiply the candidate side by a string-length gate.
-
-5. **Generation reward**: In the QA stage, use the quantile of decoding attention mass as the cutoff. Recalled segments with mass not lower than the cutoff are recorded as rewarded, and the rest as penalized: new lateral edges are created among rewarded segments from the current block, from question slots to carriers, and from question slots to rewarded segments; existing edges are modulated by “mass − cutoff.”
+1. **Segment attention graph**: one forward pass per write block; attention of layer `layer` is aggregated per segment with `tokensum`. After the positional prior is removed, each row keeps `top-3` targets and each target at most `4` incoming edges, and edges are mirrored. For each attender, the target with the largest weight in its row receives negative edges to the remaining targets of that row, weighted by the relative drop within the row, with edge weights bounded by `2.0` in absolute value.
+2. **Spiking encoding**: each token embedding is projected by a fixed random matrix from `4096` dimensions down to `128` dimensions (`8192/64`); per token the `top-8` entries are set to 1 and the rest to 0, and the results are concatenated in token order into an `8192`-dimensional segment pattern.
+3. **Spiking recall**: question tokens are unrolled into a spike vector and propagated along lateral edges for `6` steps, with membrane potential `mem_t = 0.5·mem_{t-1} + L·s_{t-1}`. The firing threshold is `0.7×clamp(ref/u)`, where `u` is the attention mass of the slot and `ref` the median of positive masses over written slots; the spike amplitude equals the threshold and firing enters a hard refractory period. Fired segments become carriers and are expanded in anchor-score order.
+4. **Anchor scoring**: per-position cosine similarity between question and candidate segments below `0.4` is set to 0; the maximum over candidates is taken for each query token, then the maximum positive contiguous run is taken on the query side; the candidate side is additionally scaled by the length gate `min(1, chars/5)`.
+5. **Generation reward**: during question answering the decode attention mass is cut at its `25%` quantile; recalled segments at or above the cut count as rewarded and the rest as penalized: new lateral edges are created between rewarded segments of the current block, from question slots to carriers, and from question slots to rewarded segments; existing edges are modulated by `mass − cut`.
 
 ## Benchmarks
 
@@ -111,7 +107,7 @@ All arguments are keyword arguments.
 
 ### `SynapticaMemory(input_size, num_slots, *, ...)`
 
-`input_size` must equal the encoder's `num_neurons`; `num_slots` is the initial slot capacity and grows on demand as content is written. Remaining keywords: `lr=0.05`, `seed=0`, `weight_init=0.3`, `max_weight=1.0`, `trace_decay=0.95`, `eligibility_decay=0.9`, `teacher_amplitude=5.0`, `device=None`, `lateral_cfg=None`, `store=None`, `max_cached_segments=0`. `lateral_cfg` controls lateral edges and recall; `store` can be a `SegmentStore` for on-disk segments.
+`input_size` must equal the encoder's `num_neurons`; `num_slots` is the initial slot capacity and grows on demand as content is written. Remaining keywords: `device=None`, `lateral_cfg=None`, `store=None`, `max_cached_segments=0`. `lateral_cfg` controls lateral edges and recall; `store` can be a `SegmentStore` for on-disk segments.
 
 ### `LateralConfig`
 
@@ -137,7 +133,7 @@ This backend is designed for the Qwen 3.5 architecture and implements the above 
 1. `truncated_hidden_attn` must return the segment-level attention map for that layer on the raw input sequence.
 2. `generate_ids` must support `prompts_are_ids=True`.
 
-We would very much welcome contributions from the open-source community to develop back-ends based on other model architectures for this project!
+We warmly welcome the open-source community to provide backends for other model architectures!
 
 ## Layout
 

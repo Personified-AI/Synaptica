@@ -798,7 +798,9 @@ class Synaptica:
             for a, b in spans
         ]
         n_written = int(
-            self.memory.write_batch([pats[i] for i in range(len(spans))], new_slots)
+            self.memory.remember_slot_patterns(
+                [pats[i] for i in range(len(spans))], new_slots
+            )
         )
         if n_written != len(new_slots):
             raise RuntimeError(f"生成段写入条数 {n_written} 与段数 {len(new_slots)} 不一致")
@@ -1031,10 +1033,9 @@ class Synaptica:
                     )
                 )
             )
-        self.memory.write_batch(
+        self.memory.remember_slot_patterns(
             [emb["patterns"][i] for i in range(len(spans))], new_slots
         )
-        wmean = float(self.memory.node.weight.mean())
         r.write_stats = [
             WriteStats(
                 index=int(s),
@@ -1042,7 +1043,6 @@ class Synaptica:
                 repeats=1,
                 eligibility_norm=0.0,
                 delta_abs_mean=0.0,
-                weight_mean=wmean,
             )
             for s in new_slots
         ]

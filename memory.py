@@ -1,0 +1,1034 @@
+
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass, field
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+
+import torch
+from torch import Tensor
+
+from ..ann.seq_match import SeqMatcher
+from .node import LateralConfig, LateralState, SynapticaNode
+from .store import SegmentStore, as_token_ids
+
+__all__ = ["RecallResult", "WriteStats", "PatternPrep", "SynapticaMemory"]
+
+class PatternPrep:
+
+    def __call__(self, pattern: Tensor) -> Tensor:
+        p = torch.as_tensor(pattern).float().reshape(-1)
+        return p / p.sum().clamp_min(1.0)
+
+@dataclass
+class RecallResult:
+
+    order: List[int] = field(default_factory=list)
+    scores: List[float] = field(default_factory=list)
+    spikes: Optional[Tensor] = None
+    membrane: Optional[Tensor] = None
+
+@dataclass
+class WriteStats:
+
+    index: int
+    reward: float
+    repeats: int
+    eligibility_norm: float
+    delta_abs_mean: float
+    skipped: bool = False
+
+    def as_dict(self) -> dict:
+        return asdict(self)
+
+class SynapticaMemory:
+
+    def __init__(
+        self,
+        input_size: int,
+        num_slots: int,
+        *,
+        device: Optional[Union[str, torch.device]] = None,
+        lateral_cfg: Optional[LateralConfig] = None,
+        store: Optional[SegmentStore] = None,
+        max_cached_segments: int = 0,
+    ) -> None:
+        if int(input_size) <= 0:
+            raise ValueError(f"input_size 必须是正整数，收到 {input_size}")
+        if int(num_slots) <= 0:
+            raise ValueError(f"num_slots 必须是正整数，收到 {num_slots}")
+        self.input_size = int(input_size)
+        self.num_slots = int(num_slots)
+        self.prepare = PatternPrep()
+
+        self.lateral_cfg = lateral_cfg or LateralConfig()
+
+        self.segment_store = store
+
+        self.max_cached_segments = int(max_cached_segments)
+        self._cache_order: List[int] = []
+
+        self.node = SynapticaNode(
+            input_size=self.input_size,
+            output_size=self.num_slots,
+            device=device,
+        )
+
+        self.node.attach_lateral(cfg=self.lateral_cfg)
+
+        self._pattern_index: Dict[str, int] = {}
+
+        self.n_pattern_hits: int = 0
+
+        self.n_pattern_encode_errors: int = 0
+        self._pattern_encode_error_note: Optional[str] = None
+        self.payloads: Dict[int, Any] = {}
+
+        self.embedding_dim: int = 0
+        self.token_dim: int = 0
+
+        self.pattern_len: int = 0
+
+        self._token_dims: int = 0
+
+        self._pattern_cache: Dict[int, Tuple[Tuple[int, ...], Tensor]] = {}
+
+        self._tokens_cache: Dict[int, Tuple[Tuple[int, ...], Tensor]] = {}
+
+        self.segment_encoder: Optional[Any] = None
+
+        self.pad_token_id: Optional[int] = None
+
+        self.special_token_ids: set = set()
+
+        self.token_counts: Dict[int, int] = {}
+        self.token_total: int = 0
+
+        self._state_version: int = 0
+
+        self._c_slots: Tuple[int, List[int]] = (-1, [])
+
+        self._c_segments: Tuple[int, List[int]] = (-1, [])
+
+        self._c_written: Tuple[int, Optional[Tensor]] = (-1, None)
+
+        self._c_pool_item: Dict[int, Tuple[int, Tuple[int, Tensor, Tensor]]] = {}
+
+        self._c_pool_aux: Dict[Any, Tuple[List[Any], List[Any], List[Any], set]] = {}
+
+    def _bump(self) -> int:
+        self._state_version = int(self._state_version) + 1
+        self._c_slots = (-1, [])
+        self._c_segments = (-1, [])
+        self._c_written = (-1, None)
+        self._c_pool_item.clear()
+        self._c_pool_aux.clear()
+        return self._state_version
+
+    def payload(self, index: int) -> Any:
+        return self.segment_token_ids(index) or []
+
+    def written_mask(self) -> Tensor:
+        _ver, _cached = self._c_written
+        if _cached is not None and int(_ver) == int(self._state_version):
+            return _cached.clone()
+        m = torch.zeros(
+            self.num_slots, dtype=torch.bool, device=self.node.mem.device
+        )
+        keys = self.stored_slots()
+        if keys:
+            m[torch.tensor(sorted(set(keys)), device=m.device)] = True
+        self._c_written = (int(self._state_version), m)
+        return m.clone()
+
+    def ensure_slots(self, n: int) -> int:
+        n = int(n)
+        if n > self.num_slots:
+            self.node.grow(n)
+            self.num_slots = int(self.node.output_size)
+            if self.node.lateral is not None:
+                self.node.lateral.ensure_slots(self.num_slots)
+
+            self._bump()
+        return self.num_slots
+
+    def ensure_laterals_slots(self) -> int:
+        lat = self.node.lateral
+        if lat is None:
+            raise RuntimeError("侧向突触未初始化")
+        return int(lat.num_slots)
+
+    @property
+    def num_laterals_edges(self) -> int:
+        lat = self.node.lateral
+        if self.node.lateral is not None and self.node.lateral.neg_index.shape[1]:
+            return int(self.node.lateral.num_edges + self.node.lateral.neg_index.shape[1])
+        return 0 if lat is None else int(lat.num_edges)
+
+    @property
+    def mean_laterals_slots(self) -> float:
+        lat = self.node.lateral
+        return 0.0 if lat is None else float(lat.mean_degree)
+
+    @property
+    def laterals_index(self) -> Tensor:
+        lat = self.node.lateral
+        if lat is None:
+            return torch.zeros(2, 0, dtype=torch.long)
+        if lat.neg_index.shape[1]:
+            return torch.cat([lat.index, lat.neg_index], dim=1)
+        return lat.index
+
+    @property
+    def laterals_values(self) -> Tensor:
+        lat = self.node.lateral
+        if lat is None:
+            return torch.zeros(0)
+        if lat.neg_values.numel():
+            return torch.cat([lat.values, lat.neg_values])
+        return lat.values
+
+    def note_attention_u(self, u_by_slot: Dict[int, float]) -> None:
+        if not u_by_slot:
+            return
+        _n = max(int(k) for k in u_by_slot) + 1
+        _cur = getattr(self, "attn_u", None)
+        if _cur is None or int(_cur.numel()) < _n:
+            _new = torch.zeros(max(_n, int(_cur.numel()) if _cur is not None else 0),
+                               dtype=torch.float32)
+            if _cur is not None:
+                _new[:int(_cur.numel())] = _cur
+            self.attn_u = _new
+            _cur = _new
+        for _k, _v in u_by_slot.items():
+            _i = int(_k)
+            if _i < int(_cur.numel()) and float(_v) > float(_cur[_i]):
+                _cur[_i] = float(_v)
+
+    def attention_marge_laterals(
+        self, graph: Any, *, slot_index: Sequence[int], prefix_len: int
+    ) -> Tuple[int, int]:
+        lat = self.node.lateral
+        if lat is None:
+            raise RuntimeError("侧向突触未初始化")
+        self.ensure_laterals_slots()
+        before = int(lat.num_edges)
+        lat.merge_edges(
+            graph,
+            slot_index=list(slot_index),
+            prefix_len=int(prefix_len),
+            alpha=float(self.lateral_cfg.alpha),
+            max_new_per_segment=int(self.lateral_cfg.max_new_edges_per_segment),
+        )
+        after = int(lat.num_edges)
+        n_cross = int(
+            lat.count_edges(
+                dest=list(range(int(prefix_len))),
+                src=list(slot_index[int(prefix_len) :]),
+            )
+        )
+        return after - before, n_cross
+
+    def add_laterals(
+        self, dest: Sequence[int], src: Sequence[int], values: Sequence[float],
+        *, weak: bool = False
+    ) -> int:
+        lat = self.node.lateral
+        if lat is None:
+            raise RuntimeError("侧向突触未初始化")
+        st = lat.add_laterals(list(dest), list(src), list(values),
+                              mode="create_only", weak=bool(weak))
+        return int(st.get("created", 0))
+
+    def has_lateral(self, dest: int, src: int) -> bool:
+        lat = self.node.lateral
+        if lat is None or lat.num_edges == 0:
+            return False
+        m = (lat.index[0] == int(dest)) & (lat.index[1] == int(src))
+        return bool(m.any())
+
+    def add_negative_laterals(
+        self,
+        u: Dict[int, float],
+        *,
+        attended: Optional[Sequence[int]] = None,
+        exclude: Sequence[int] = (),
+        max_per_dest: Optional[int] = None,
+    ) -> int:
+        lat = self.node.lateral
+        if lat is None:
+            raise RuntimeError("侧向突触未初始化")
+        cfg = self.lateral_cfg
+        return int(
+            lat.add_negative_edges(
+                u,
+                attended=attended,
+                gain=float(cfg.neg_gain),
+                exclude=exclude,
+                q=float(cfg.attn_q),
+
+                max_per_dest=int(max_per_dest or 0),
+            )
+        )
+
+    def walked_laterals(self) -> List[Tuple[int, int, float]]:
+        lat = self.node.lateral
+        return [] if lat is None else list(lat.edges())
+
+    def modulate_laterals(
+        self, edges: Sequence[Tuple[int, int, float]], mod: Dict[int, float]
+    ) -> Dict[str, Any]:
+        lat = self.node.lateral
+        if lat is None:
+            raise RuntimeError("侧向突触未初始化")
+        cfg = self.lateral_cfg
+        return dict(
+            lat.modulate(
+                list(edges),
+                mod,
+                lr=float(cfg.lr),
+                decay=float(cfg.decay),
+            )
+        )
+
+    def state_dict(self) -> Dict[str, Any]:
+        return {
+            "input_size": int(self.input_size),
+            "num_slots": int(self.num_slots),
+
+            "payloads": {
+                int(s): tuple(self.segment_token_ids(s) or [])
+                for s in self.stored_slots()
+            },
+
+            "embedding_dim": int(self.embedding_dim),
+            "token_dim": int(self.token_dim),
+
+            "pattern_len": int(self.pattern_len),
+            "token_dims": int(self._token_dims),
+            "token_counts": {int(k): int(v) for k, v in self.token_counts.items()},
+            "token_total": int(self.token_total),
+            "node": self.node.state_dict(),
+        }
+
+    @staticmethod
+    def _as_token_ids(p: Any) -> List[int]:
+        return as_token_ids(p)
+
+    def load_state_dict(
+        self,
+        state: Dict[str, Any],
+        *,
+        device: Optional[Union[str, torch.device]] = None,
+    ) -> "SynapticaMemory":
+        if int(state["input_size"]) != int(self.input_size):
+            raise ValueError(f"input_size 不一致：存档 {state['input_size']} vs 当前 {self.input_size}")
+        dev = torch.device(device) if device is not None else self.node.mem.device
+        self.payloads = {int(k): v for k, v in state["payloads"].items()}
+
+        self._cache_order = sorted(self.payloads)
+        self.embedding_dim = int(state["embedding_dim"])
+        self.token_dim = int(state["token_dim"])
+        self.pattern_len = int(state.get("pattern_len", 0))
+        self._token_dims = int(state.get("token_dims", 0))
+        self.token_counts = {int(k): int(v) for k, v in state["token_counts"].items()}
+        self.token_total = int(state["token_total"])
+        self.num_slots = int(state["num_slots"])
+
+        self.node = SynapticaNode(
+            input_size=self.input_size, output_size=max(1, self.num_slots), device=dev
+        )
+        self.node.load_state_dict(state["node"], device=dev)
+        self.num_slots = int(self.node.output_size)
+
+        if self.node.lateral is not None:
+            self.lateral_cfg = self.node.lateral.cfg
+
+        self._bump()
+        return self
+
+    def store(self, payload: Any, index: Optional[int] = None) -> int:
+
+        if index is not None:
+            self._pattern_cache.pop(int(index), None)
+            self._tokens_cache.pop(int(index), None)
+        idx = self.store_payload_only(payload, index)
+        ids = self.segment_token_ids(idx) or []
+        if ids:
+            self.observe_tokens(ids)
+        return idx
+
+    def store_payload_only(self, payload: Any, index: Optional[int] = None) -> int:
+
+        _auto_slot = index is None
+        if index is None:
+            index = self._next_free_slot()
+        index = int(index)
+        if index < 0:
+            raise ValueError(f"槽号不能为负：{index}")
+        if index >= self.num_slots:
+
+            self.ensure_slots(index + 1)
+        ids = self._as_token_ids(payload)
+
+        _new_pattern = None
+        if _auto_slot:
+            try:
+
+                _new_pattern = self._encode(ids)[1]
+                _hit = self.find_by_pattern(_new_pattern)
+            except Exception as _exc:
+
+                self.n_pattern_encode_errors = int(
+                    getattr(self, "n_pattern_encode_errors", 0)) + 1
+                if not getattr(self, "_pattern_encode_error_note", None):
+                    self._pattern_encode_error_note = (
+                        f"{type(_exc).__name__}: {_exc}")
+                _new_pattern, _hit = None, None
+            if _hit is not None:
+                self.n_pattern_hits = int(getattr(self, "n_pattern_hits", 0)) + 1
+
+                return int(_hit)
+            index = self._next_free_slot()
+        self.payloads[index] = tuple(ids)
+        self._touch_cache(index)
+        if _new_pattern is not None:
+            self.index_pattern(_new_pattern, int(index))
+        if self.segment_store is not None:
+            self.segment_store.append(index, ids)
+
+        self._bump()
+        return index
+
+    def _next_free_slot(self) -> int:
+        used = set(int(s) for s in self.payloads)
+        if self.segment_store is not None:
+            used |= set(int(s) for s in self.segment_store.slots)
+        i = 0
+        while i in used:
+            i += 1
+        return i
+
+    def _require_encoder(self) -> Any:
+        if self.segment_encoder is None:
+            raise RuntimeError("缺少段编码器：需先注入 token_ids -> (base, feat) 的可调用对象")
+        return self.segment_encoder
+
+    def _encode(self, token_ids: Sequence[int]) -> Tuple[Tensor, Tensor]:
+        enc = self._require_encoder()
+        ids = [int(x) for x in token_ids]
+        out = enc(ids)
+        if not isinstance(out, (tuple, list)) or len(out) != 2:
+            raise RuntimeError(f"segment_encoder 应返回 (base, pattern)，收到 {type(out).__name__}")
+        base = torch.as_tensor(out[0], dtype=torch.float32).reshape(-1)
+        pat = torch.as_tensor(out[1], dtype=torch.float32).reshape(-1)
+        n = len(ids)
+        if base.numel() == 0:
+            raise ValueError(f"encoder 对 {n} 个 token 返回了空的段级表示")
+        if pat.numel() == 0:
+            raise ValueError(f"encoder 对 {n} 个 token 返回了空模式")
+        if self.pattern_len and int(pat.numel()) != int(self.pattern_len):
+            raise ValueError(f"模式长度 {int(pat.numel())} 与已记录的 {int(self.pattern_len)} 不一致")
+        dev = self.node.mem.device
+        if int(self.embedding_dim) and base.numel() != int(self.embedding_dim):
+            raise ValueError(f"段级表示维度 {base.numel()} 与已记录的 {int(self.embedding_dim)} 不一致")
+        self.pattern_len = int(pat.numel())
+        self.embedding_dim = int(base.numel())
+        return base.to(dev), pat.to(dev)
+
+    def segment_tokens(self, slot: int) -> Optional[Tensor]:
+        ids = self.segment_token_ids(slot)
+        if not ids:
+            return None
+        k = self.token_dims
+        if k <= 0:
+            raise RuntimeError("token_dims 未确定：注入编码器时须先建立段长与模式维度的整除关系")
+        _ids_key = tuple(int(x) for x in ids)
+        _hit = self._tokens_cache.get(int(slot))
+        if _hit is not None and _hit[0] == _ids_key:
+            return _hit[1]
+        pat = self._cached_pattern(slot, ids)
+        if pat is None:
+            pat = self._encode(ids)[1]
+
+        n_tok = len(ids)
+        need = n_tok * int(k)
+        if int(pat.numel()) < need:
+            raise ValueError(
+                f"从模式取 {n_tok} 个 token 的特征需要 {need} 维，"
+                f"模式只有 {int(pat.numel())} 维"
+            )
+        out = pat[:need].reshape(n_tok, int(k))
+        self._tokens_cache[int(slot)] = (_ids_key, out)
+        return out
+
+    def _cached_pattern(self, slot: int, ids: Sequence[int]) -> Optional[Tensor]:
+        hit = self._pattern_cache.get(int(slot))
+        if hit is None:
+            return None
+        fp, pat = hit
+        if tuple(int(x) for x in ids) != fp:
+            return None
+        return pat
+
+    def _remember_pattern(self, slot: int, ids: Sequence[int], pattern: Tensor) -> None:
+        self._pattern_cache[int(slot)] = (
+            tuple(int(x) for x in ids),
+            pattern.detach().to("cpu").float().reshape(-1).clone(),
+        )
+    @property
+    def token_dims(self) -> int:
+        return int(self._token_dims)
+
+    def set_token_dims(self, k: int) -> None:
+        if int(k) <= 0:
+            raise ValueError("token_dims 必须是正整数")
+        self._token_dims = int(k)
+
+    def bind_encoder(self, encoder_fn: Any, shape: Any) -> None:
+        seg, k, n = int(shape[0]), int(shape[1]), int(shape[2])
+        if seg <= 0 or k <= 0 or n <= 0:
+            raise ValueError(f"编码器报出的分区含非正数：{tuple(shape)}")
+        if n != seg * k:
+            raise ValueError(
+                f"编码器分区不自洽：num_neurons={n} ≠ segment_tokens={seg} × token_dims={k}"
+            )
+        if self.pattern_len and n != self.pattern_len:
+            raise ValueError(f"编码器模式维度 {n} 与存档记录的 pattern_len={self.pattern_len} 不符")
+        if self._token_dims and k != self._token_dims:
+            wrote_seg = self.pattern_len // self._token_dims if self._token_dims else 0
+            raise ValueError(f"编码器每 token 维度 {k} 与存档记录的 token_dims={self._token_dims} 不符")
+        self.segment_encoder = encoder_fn
+
+        self.pattern_len = int(n)
+        self.set_token_dims(k)
+
+        self._rebuild_pattern_cache()
+
+    def _rebuild_pattern_cache(self) -> int:
+        if int(self._token_dims) <= 0:
+            return 0
+        n = 0
+        for slot in self.stored_segments():
+            ids = self.segment_token_ids(slot) or []
+            if not ids or self._cached_pattern(slot, ids) is not None:
+                continue
+
+            pat = self.prepare(self._encode(ids)[1])
+            self._remember_pattern(slot, ids, pat)
+            n += 1
+        return n
+
+    def token_lens(self, token_ids: Sequence[int]) -> Tensor:
+        _fn = getattr(self, "token_len_fn", None)
+        if _fn is None:
+            return torch.full((len(token_ids),), 8.0, dtype=torch.float32)
+        return torch.tensor([float(x) for x in _fn([int(t) for t in token_ids])],
+                            dtype=torch.float32)
+
+    def _recall_pool_aux(self, pool: Sequence[int], scope: Optional[Sequence[int]]
+                         ) -> Tuple[List[Any], List[Any], List[Any], set]:
+        _key = (int(self._state_version), tuple(int(s) for s in pool))
+        _hit = self._c_pool_aux.get(_key)
+        if _hit is not None:
+            return _hit
+        pool_items = [self._pool_item(int(s)) for s in pool]
+        _cand_valid = [self.valid_len(self.segment_token_ids(int(s))) for s in pool]
+        _cand_ids = [self.segment_token_ids(int(s)) or [] for s in pool]
+        _bad_ids = set(int(x) for x in (getattr(self, "special_token_ids", None) or ()))
+        out = (pool_items, _cand_valid, _cand_ids, _bad_ids)
+        if len(self._c_pool_aux) >= 8:
+            self._c_pool_aux.clear()
+        self._c_pool_aux[_key] = out
+        return out
+
+    @property
+    def _segment_token_ids(self) -> Dict[int, List[int]]:
+        return {int(s): (self.segment_token_ids(s) or []) for s in self.stored_slots()}
+
+    def segment_token_ids(self, slot: int) -> Optional[List[int]]:
+        s = int(slot)
+        p = self.payloads.get(s)
+        if p is None and self.segment_store is not None:
+            got = self.segment_store.read(s)
+            if got is not None:
+                self.payloads[s] = tuple(got)
+                self._touch_cache(s)
+                p = self.payloads[s]
+        if p is None:
+            return None
+        if isinstance(p, torch.Tensor):
+            return [int(x) for x in p.reshape(-1).tolist()]
+        return [int(x) for x in p]
+
+    def segment_pattern(self, slot: int) -> Optional[Tensor]:
+        ids = self.segment_token_ids(slot)
+        if not ids:
+            return None
+        pat = self._cached_pattern(int(slot), ids)
+        if pat is None:
+
+            pat = self.prepare(self._encode(ids)[1])
+        return pat
+
+    @staticmethod
+    def pattern_key(pat) -> str:
+        import hashlib
+
+        t = pat.detach().to("cpu", torch.float32).contiguous()
+        return hashlib.md5(t.numpy().tobytes()).hexdigest()
+
+    def find_by_pattern(self, pat) -> Optional[int]:
+        key = self.pattern_key(pat)
+        slot = self._pattern_index.get(key)
+        if slot is None:
+            return None
+        if slot not in self.payloads:
+
+            del self._pattern_index[key]
+            return None
+        return int(slot)
+
+    def index_pattern(self, pat, slot: int) -> None:
+        self._pattern_index[self.pattern_key(pat)] = int(slot)
+
+    def pattern_index_size(self) -> int:
+        return len(self._pattern_index)
+
+    def stored_slots(self) -> List[int]:
+        _ver, _cached = self._c_slots
+        if int(_ver) == int(self._state_version):
+            return _cached
+        if self.segment_store is not None:
+            out = [int(s) for s in self.segment_store.slots]
+        else:
+            out = sorted(int(s) for s in self.payloads)
+        self._c_slots = (int(self._state_version), out)
+        return out
+
+    def has_slot(self, slot: int) -> bool:
+        s = int(slot)
+        if s in self.payloads:
+            return True
+        return self.segment_store is not None and bool(self.segment_store.has(s))
+
+    @property
+    def num_segments(self) -> int:
+        return len(self.stored_slots())
+
+    def _touch_cache(self, slot: int) -> None:
+        s = int(slot)
+        if s in self._cache_order:
+            self._cache_order.remove(s)
+        self._cache_order.append(s)
+        cap = int(self.max_cached_segments)
+        while cap > 0 and len(self._cache_order) > cap:
+            old = self._cache_order.pop(0)
+            self.payloads.pop(old, None)
+
+    def valid_len(self, token_ids: Optional[Sequence[int]]) -> Optional[int]:
+        if token_ids is None or self.pad_token_id is None:
+            return None
+        ids = [int(x) for x in token_ids]
+        pid = int(self.pad_token_id)
+        n = len(ids)
+        while n > 0 and ids[n - 1] == pid:
+            n -= 1
+        return int(n)
+
+    def _pool_item(self, slot: int) -> Tuple[int, Tensor, Tensor]:
+        _ver, _hit = self._c_pool_item.get(int(slot), (-1, None))[:2]
+        if _hit is not None and int(_ver) == int(self._state_version):
+            return _hit
+        ids = self.segment_token_ids(slot) or []
+        item = (int(slot), self.segment_tokens(slot), self.token_lens(ids))
+        self._c_pool_item[int(slot)] = (int(self._state_version), item)
+        return item
+
+    def observe_tokens(self, token_ids: Sequence[int]) -> None:
+        for t in token_ids:
+            k = int(t)
+            self.token_counts[k] = self.token_counts.get(k, 0) + 1
+        self.token_total += len(token_ids)
+
+        self._bump()
+
+    def stored_segments(self) -> List[int]:
+        _ver, _cached = self._c_segments
+        if int(_ver) == int(self._state_version):
+            return _cached
+        out = [s for s in self.stored_slots() if self.segment_token_ids(s)]
+        self._c_segments = (int(self._state_version), out)
+        return out
+
+    @torch.no_grad()
+    def ref_recall(
+        self,
+        query_tokens: Tensor,
+        *,
+        matcher: SeqMatcher,
+        query_freq: Optional[Tensor] = None,
+        scope: Optional[Sequence[int]] = None,
+        steps: int = 1,
+        gate_keep: float = 1.0,
+        query_valid: Optional[int] = None,
+        ref_anchor_k: int = 1,
+        force_anchor: Optional[Tuple[int, float, int]] = None,
+        query_slot_hint: Optional[int] = None,
+        slot_upper_bound: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        out: Dict[str, Any] = {
+            "recalled": [],
+            "anchors": [],
+            "carriers": [],
+            "used_carriers": [],
+            "scores": {},
+            "n_no_edge": 0,
+            "n_miss": 0,
+        }
+
+        _traversed: list = []
+        pool = self.stored_segments()
+        if scope is not None:
+            allow = {int(s) for s in scope}
+            pool = [s for s in pool if s in allow]
+        if not pool:
+            out["n_miss"] = 1
+            return out
+
+        matcher.score_device = None
+
+        pool_items, _cand_valid, _cand_ids, _bad_ids = self._recall_pool_aux(pool, scope)
+
+        if query_slot_hint is not None:
+
+            _h = int(query_slot_hint)
+            _hl = self.valid_len(self.segment_token_ids(_h)) if (
+                self.segment_token_ids(_h) is not None) else 0
+            _anchors = [(_h, 1.0, int(_hl))]
+        elif force_anchor is not None:
+            _anchors = [(int(force_anchor[0]), float(force_anchor[1]), int(force_anchor[2]))]
+        elif int(ref_anchor_k) > 1:
+            _anchors = [a for a in matcher.top_of(
+                query_tokens, pool_items, k=int(ref_anchor_k), freq_q=query_freq,
+                query_valid=query_valid, cand_valid=_cand_valid,
+                cand_ids=_cand_ids, bad_ids=_bad_ids) if float(a[1]) > 0.0]
+        else:
+            _one = matcher.best_of(query_tokens, pool_items, freq_q=query_freq,
+                                   query_valid=query_valid, cand_valid=_cand_valid,
+                cand_ids=_cand_ids, bad_ids=_bad_ids)
+            _anchors = [] if _one is None else [a for a in [_one] if float(a[1]) > 0.0]
+        if not _anchors:
+            out["n_miss"] = 1
+            return out
+        ref_slot, ref_score = int(_anchors[0][0]), float(_anchors[0][1])
+        out["anchors"] = [(int(a[0]), float(a[1])) for a in _anchors]
+        out["n_anchors_k"] = len(_anchors)
+
+        _cw: Dict[int, float] = {}
+
+        _lf_theta = getattr(self.lateral_cfg, "recall_fire_theta", None)
+
+        _slot_gain = None
+        _kz = float(getattr(self.lateral_cfg, "pfc_z_coef", 0.0))
+        if _kz > 0.0 and len(_anchors) > 0:
+            _sp = matcher._score_pool(
+                query_tokens, pool_items, freq_q=query_freq,
+                query_valid=query_valid, cand_valid=_cand_valid,
+                cand_ids=_cand_ids, bad_ids=_bad_ids)
+            if _sp is not None:
+                _sl, _sc, _ln = _sp
+                _sl = [int(x) for x in _sl]
+                _sc = torch.as_tensor(_sc, dtype=torch.float32)
+                _ln = torch.as_tensor(_ln, dtype=torch.float32)
+                _keep = (_ln > 0)
+                _vals = torch.where(_keep, _sc, torch.zeros_like(_sc))
+                if bool(_keep.any()):
+                    _mu = float(_vals[_keep].mean())
+                    _sd = float(_vals[_keep].std(unbiased=False))
+                    if _sd > 0.0:
+                        _z = (_vals - _mu) / _sd
+                        _g = torch.exp(_kz * _z).clamp(0.2, 5.0)
+                        _slot_gain = torch.ones(
+                            int(self.num_slots), dtype=_g.dtype, device=_g.device)
+                        for _b, _s_ix in enumerate(_sl):
+                            if 0 <= _s_ix < int(self.num_slots):
+                                _slot_gain[_s_ix] = _g[_b]
+        _res_lat = self.recall_lateral(
+            seed_slots=[int(_a[0]) for _a in _anchors],
+            slot_gain=_slot_gain,
+            steps=int(steps),
+            fire_theta=(None if _lf_theta is None else float(_lf_theta)),
+
+            slot_upper_bound=slot_upper_bound,
+        )
+        _lat_scores = list(getattr(_res_lat, "scores", None) or [])
+        for _i2, _sl in enumerate(getattr(_res_lat, "order", None) or []):
+            _k2 = int(_sl)
+            _w = float(_lat_scores[_i2]) if _i2 < len(_lat_scores) else 1.0
+            if _k2 not in _cw or _w > _cw[_k2]:
+                _cw[_k2] = _w
+        carriers = sorted(_cw.items(), key=lambda kv: (-kv[1], kv[0]))
+
+        for _c_slot, _c_w in carriers:
+            _traversed.append([int(ref_slot), int(_c_slot), float(_c_w), "carrier"])
+
+        if query_slot_hint is not None:
+            _h = int(query_slot_hint)
+            out["used_pattern_hint"] = True
+            _set = {int(ref_slot)} | {int(_s) for _s, _w in carriers}
+            _set.add(int(_h))
+            out["recalled"] = sorted(_set)
+            _uc = {int(_s) for _s, _w in carriers}
+            _uc.add(int(_h))
+            out["used_carriers"] = sorted(_uc)
+            out["scores"] = {int(_s): float(_w) for _s, _w in carriers}
+            out["scores"][int(ref_slot)] = float(ref_score)
+            out["scores"][int(_h)] = 1.0
+
+            out["audit"] = {
+                "anchors": list(out["anchors"]),
+                "used_carriers": list(out["used_carriers"]),
+                "traversed_edges": list(_traversed),
+                "n_recalled": len(_set),
+                "n_carriers_total": len(carriers),
+                "n_anchor": 1,
+                "n_a1_new": len(carriers),
+            }
+            return out
+
+        if not carriers:
+
+            out["n_no_edge"] = 1
+            out["recalled"] = [int(ref_slot)]
+            out["used_carriers"] = [int(ref_slot)]
+            out["scores"] = {int(ref_slot): float(ref_score)}
+            return out
+
+        scored: Dict[int, float] = {}
+
+        for ref1_slot, _w in carriers:
+            toks = self.segment_tokens(ref1_slot)
+            if toks is None:
+                continue
+            out["carriers"].append(int(ref1_slot))
+
+        scored[int(ref_slot)] = max(
+            scored.get(int(ref_slot), float("-inf")), float(ref_score)
+        )
+
+        gate = float("-inf")
+        if carriers:
+            _ws = torch.tensor([float(w) for _s, w in carriers], dtype=torch.float32)
+
+            _keep = min(max(float(gate_keep), 0.0), 1.0)
+            if _keep < 1.0:
+                gate = float(torch.quantile(_ws, 1.0 - _keep))
+            for _c_slot, _c_w in carriers:
+                if float(_c_w) >= gate:
+                    scored[int(_c_slot)] = max(
+                        scored.get(int(_c_slot), float("-inf")), float(_c_w)
+                    )
+
+        _rec = {int(k) for k in scored.keys()}
+        _rec |= {int(_c) for _c, _w in carriers}
+        _rec.add(int(ref_slot))
+        out["recalled"] = sorted(_rec)
+        out["n_FIRED_added"] = len(_rec) - len(scored)
+        out["used_carriers"] = sorted({int(c) for c in out["carriers"]})
+
+        out["scores"] = {int(k): float(v) for k, v in scored.items()}
+
+        a1_counts: Dict[int, float] = {}
+        for _c_slot, _c_w in carriers:
+            a1_counts[int(_c_slot)] = max(a1_counts.get(int(_c_slot), float("-inf")),
+                                          float(_c_w))
+        a1_kept = {k for k, v in a1_counts.items() if v >= gate}
+        a1_gated_out = set(a1_counts) - a1_kept
+        anchor_slots = {int(ref_slot)}
+        anchor_new = anchor_slots - a1_kept
+        out["audit"] = {
+
+            "anchors": list(out["anchors"]),
+
+            "used_carriers": list(out["used_carriers"]),
+
+            "traversed_edges": list(_traversed),
+
+            "anchor_slot": int(ref_slot),
+            "anchor_score": float(ref_score),
+            "n_anchor": len(anchor_new),
+            "anchor_slots": sorted(anchor_new),
+
+            "n_a1_new": len(a1_kept),
+
+            "n_carriers_total": len(a1_counts),
+
+            "n_a1_gated_out": len(a1_gated_out),
+
+            "gate": float(gate),
+            "n_recalled": len(out["recalled"]),
+        }
+        return out
+
+    @torch.no_grad()
+    def remember_slot_patterns(
+        self,
+        patterns: Sequence[Tensor],
+        indices: Sequence[int],
+    ) -> int:
+        idx = [int(i) for i in indices]
+        if not idx:
+            return 0
+        if len(idx) != len(patterns):
+            raise ValueError(f"patterns 与 indices 长度不一致：{len(patterns)} vs {len(idx)}")
+        if max(idx) >= self.num_slots:
+            self.ensure_slots(max(idx) + 1)
+        pats = [self.prepare(p) for p in patterns]
+        for _i, _sl in enumerate(idx):
+            _ids = self.segment_token_ids(_sl) or []
+            if _ids:
+                self._remember_pattern(_sl, _ids, pats[_i])
+        self.node.reset()
+
+        self._bump()
+        return len(idx)
+
+    @torch.no_grad()
+    def recall_lateral(
+        self,
+        *,
+        seed_slots: Sequence[int],
+        steps: int = 3,
+        fire_ratio: float = 1.0,
+        fire_theta: Optional[float] = None,
+        max_fired: int = 16384,
+        slot_upper_bound: Optional[int] = None,
+        slot_gain: Optional[Tensor] = None,
+    ) -> RecallResult:
+        if int(steps) <= 0:
+            raise ValueError("steps 必须是正整数")
+        if self.node.lateral is None or self.node.lateral.num_edges == 0:
+            return RecallResult(order=[], scores=[])
+        if not seed_slots:
+            raise ValueError("recall_lateral 需要 seed_slots")
+
+        self.node.lateral.ensure_slots(self.num_slots)
+
+        self.node.mem = torch.zeros_like(self.node.mem)
+        num = self.node.output_size
+        dev = self.node.mem.device
+        seen = torch.zeros(num, dtype=self.node.mem.dtype, device=dev)
+        out = torch.zeros_like(seen)
+        s_prev = torch.zeros_like(seen)
+
+        idx = torch.tensor([int(i) for i in seed_slots], dtype=torch.long, device=dev)
+        idx = idx[(idx >= 0) & (idx < num)]
+        if idx.numel() == 0:
+            raise ValueError("seed_slots 全部越界")
+        s_prev[idx] = 1.0
+
+        _gain = (
+            torch.ones_like(seen) if slot_gain is None
+            else slot_gain.to(seen.device, dtype=seen.dtype).clamp(0.2, 5.0)
+        )
+        written = self.written_mask()
+
+        if slot_upper_bound is not None:
+            _ub = int(slot_upper_bound)
+            _ar = torch.arange(int(written.numel()), device=written.device)
+
+            _ubmask = (_ar < _ub)
+            written = written & _ubmask
+        else:
+            _ubmask = None
+        peak = torch.zeros_like(seen)
+
+        _thr_t: Optional[Tensor] = None
+        _au = getattr(self, "attn_u", None)
+        if _au is not None and int(_au.numel()) > 0:
+            _n = int(seen.numel())
+            _u = torch.zeros(_n, dtype=torch.float32, device=seen.device)
+            _m = min(_n, int(_au.numel()))
+            _u[:_m] = _au[:_m].to(seen.device)
+            _sel = _u[written] if bool(written.any()) else _u
+            _pos = _sel[_sel > 0]
+            _ref = float(_pos.median()) if int(_pos.numel()) else 0.0
+            if _ref > 0.0:
+                _u = torch.where(_u > 0, _u, torch.full_like(_u, _ref))
+                _thr_t = (_ref / _u).clamp(0.1, 10.0)
+
+        for t in range(int(steps)):
+
+            _s_drv = s_prev if slot_gain is None else s_prev * _gain
+            if slot_gain is not None:
+                lat = (self.node.lateral.propagate(
+                           _s_drv, positive_only=True)
+                       + self.node.lateral.propagate(
+                           s_prev, negative_only=True))
+            else:
+                lat = self.node.lateral.propagate(_s_drv)
+
+            if t > 0 and float(lat.abs().sum()) == 0.0:
+                break
+
+            _mb = float(self.lateral_cfg.mem_beta)
+            mem = _mb * self.node.mem + lat
+            peak = torch.maximum(peak, mem.abs())
+            thr = self._threshold(mem, written, fire_ratio=float(fire_ratio),
+                                  fire_theta=fire_theta)
+            if _thr_t is not None:
+                thr = _thr_t * float(fire_theta)
+            _thr_vec = thr if torch.is_tensor(thr) else torch.full_like(seen, float(thr))
+            if slot_gain is not None:
+                _thr_vec = _thr_vec / _gain
+
+            spk = (mem > _thr_vec).to(self.node.mem.dtype) * _thr_vec
+            if int(t) == 0:
+
+                spk[idx] = 1.0
+            spk = spk * (1.0 - seen)
+
+            if _ubmask is not None:
+                spk = spk * _ubmask.to(spk.dtype)
+            seen = torch.clamp(seen + (spk > 0).to(seen.dtype), 0.0, 1.0)
+            out = torch.clamp(out + spk, 0.0, 1.0)
+
+            self.node.mem = mem * (1.0 - spk)
+            s_prev = spk
+            if float(s_prev.abs().sum()) == 0:
+                break
+            if float(seen.sum()) >= int(max_fired):
+                break
+
+        order = [int(i) for i in out.nonzero().flatten().tolist()]
+        scores = [float(peak[i]) for i in order]
+        return RecallResult(
+            order=order,
+            scores=scores,
+            spikes=out,
+            membrane=peak,
+        )
+
+    def _threshold(self, mem: Tensor, written: Tensor, *, fire_ratio: float,
+                   fire_theta: Optional[float] = None) -> float:
+        if fire_theta is not None:
+            return float(fire_theta)
+        if not 0.0 < float(fire_ratio) <= 1.0:
+            raise ValueError(f"fire_ratio 必须在 (0, 1]，收到 {fire_ratio}")
+        scope = mem[written] if bool(written.any()) else mem
+        scope = scope.detach().float()
+        nz = scope[scope != 0.0]
+        x = (nz if nz.numel() else scope).abs()
+        if x.numel() == 0:
+            raise ValueError("阈值统计作用域为空：没有任何已写入的槽")
+        q = 1.0 - float(fire_ratio)
+        if x.numel() == 1:
+            return float(x.min())
+        return float(torch.quantile(x, q))
+
+    def __repr__(self) -> str:
+        return (
+            f"SynapticaMemory(input={self.input_size}, slots={self.num_slots}, "
+            f"written={self.num_segments}, "
+            f"lateral={self.node.lateral.num_edges if self.node.lateral else 0})"
+        )

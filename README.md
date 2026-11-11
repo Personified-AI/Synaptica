@@ -11,7 +11,7 @@
 
 ## 快速上手
 
-依赖 PyTorch 2.x、`transformers>=4.56`（Qwen3.5 需要 5.x），以及一个具有 Full Attention 层的 Hugging Face 因果语言模型。
+依赖 PyTorch 2.x、`transformers>=4.56`（Qwen3.5 需要 5.x），以及一个能返回中间层隐状态的 Hugging Face 因果语言模型。把 `package/` 加入 `PYTHONPATH` 后按 `session`、`snn.memory`、`ann.llm.backend` 导入；若以仓库根为路径，则按 `package.session` 导入。
 
 ```bash
 pip install -r requirements.txt
@@ -30,7 +30,7 @@ cfg = SynapticaConfig(
     attn_block=256,
 )
 backend = QwenBackend("/path/to/Qwen3.5-9B", device="cuda:0")
-memory = SynapticaMemory(input_size=cfg.num_neurons, num_slots=1, seed=0)
+memory = SynapticaMemory(input_size=cfg.num_neurons, num_slots=1)
 bot = Synaptica(memory=memory, backend=backend, cfg=cfg, seed=0)
 
 with open("long_document.txt", encoding="utf-8") as f:
@@ -52,11 +52,11 @@ print(res.recalled[:10], res.context[:200])
 
 ![Synaptica 工作流程](assets/workflow-zh.png)
 
-1. **段级注意力图**：对每个写块前向，取第 `layer` 层注意力，按段聚合；扣除位置偏置后，每行保留 `TopK` 个目标、每个目标出边与入边数均受限以维持稀疏和高效。对每个目标做镜像补边，随后对每个 attender 取其行内权重最大的目标，向该行其余目标建立负边，权重按行内相对落差计算，边权绝对值上限 `2.0`。
-2. **脉冲编码**：段内每个 token 的嵌入经固定随机投影降维，逐 token 取 `top-8` 并二值化为 0/1，按 token 顺序拼接为段模式。
-3. **脉冲召回**：问题 token 编码为脉冲向量，沿侧向边传播一定步数，膜电位按 `mem_t = 0.5·mem_{t-1} + L·s_{t-1}` 更新；发放阈值取 `0.7×clamp(ref/u)`，其中 `u` 为该槽位的注意力质量、`ref` 为已写槽位正质量的中位数；发放幅度等于阈值，发放后进入硬不应期。发放的段作为载体，按锚段得分排序后展开。
-4. **锚段打分**：问题与候选段进行逐位置余弦，弱相似置零。对每个查询 token 在候选段上取最大值，再在查询侧取最大正连续子段和，候选侧另乘字符串长度门。
-5. **生成奖励**：问答阶段按解码注意力质量分位为切点，质量不低于切点的召回段记为奖励，其余记为惩罚：被奖励的本块段之间、问题槽到载体、问题槽到被奖励段之间新建侧向边；已有边按“质量 − 切点”进行调制。
+1. **段级注意力图**：每个写块执行一次前向，取第 `layer` 层注意力，按段以 `tokensum` 聚合；扣除位置偏置后，每行保留 `top-3` 个目标、每个目标至多 `4` 条入边，并做镜像补边。随后对每个 attender 取其行内权重最大的目标，向该行其余目标建立负边，权重按行内相对落差计算，边权绝对值上限 `2.0`。
+2. **脉冲编码**：段内每个 token 的嵌入经固定随机投影由 `4096` 维降到 `128` 维（`8192/64`），逐 token 取 `top-8` 并二值化为 0/1，按 token 顺序拼接为 `8192` 维段模式。
+3. **脉冲召回**：问题 token 展开为脉冲向量，沿侧向边传播 `6` 步，膜电位按 `mem_t = 0.5·mem_{t-1} + L·s_{t-1}` 更新；发放阈值取 `0.7×clamp(ref/u)`，其中 `u` 为该槽位的注意力质量、`ref` 为已写槽位正质量的中位数；发放幅度等于阈值，发放后进入硬不应期。发放的段作为载体，按锚段得分排序后展开。
+4. **锚段打分**：问题与候选段的逐位置余弦相似度低于 `0.4` 记 0；对每个查询 token 在候选段上取最大值，再在查询侧取最大正连续子段和；候选侧另乘长度门 `min(1, 字符数/5)`。
+5. **生成奖励**：问答阶段按解码注意力质量取 `25%` 分位为切点，质量不低于切点的召回段记为奖励，其余记为惩罚：被奖励的本块段之间、问题槽到载体、问题槽到被奖励段之间新建侧向边；已有边按「质量 − 切点」调制。
 
 ## 评测
 
@@ -107,7 +107,7 @@ InfiniteBench:
 
 ### `SynapticaMemory(input_size, num_slots, *, ...)`
 
-`input_size` 必须等于编码器的 `num_neurons`；`num_slots` 为初始槽位容量，写入时按需扩容。其余关键字参数：`lr=0.05`、`seed=0`、`weight_init=0.3`、`max_weight=1.0`、`trace_decay=0.95`、`eligibility_decay=0.9`、`teacher_amplitude=5.0`、`device=None`、`lateral_cfg=None`、`store=None`、`max_cached_segments=0`。`lateral_cfg` 决定侧向边与召回参数，`store` 可换成 `SegmentStore` 做磁盘落盘。
+`input_size` 必须等于编码器的 `num_neurons`；`num_slots` 为初始槽位容量，写入时按需扩容。其余关键字参数：`device=None`、`lateral_cfg=None`、`store=None`、`max_cached_segments=0`。`lateral_cfg` 决定侧向边与召回参数，`store` 可换成 `SegmentStore` 做磁盘落盘。
 
 ### `LateralConfig`
 
@@ -133,7 +133,7 @@ InfiniteBench:
 1. `truncated_hidden_attn` 必须返回该层在纯输入序列上的段级注意力图
 2. `generate_ids` 必须支持 `prompts_are_ids=True`。
 
-我们非常欢迎开源社区为本项目贡献其他模型架构的后端！
+我们非常欢迎开源社区为我们提供其他模型架构的后端！
 
 ## 目录
 
