@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+import os
 from array import array
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
@@ -94,6 +95,7 @@ class SynapticaMemory:
         lateral_cfg: Optional[LateralConfig] = None,
         store: Optional[SegmentStore] = None,
         max_cached_segments: int = 0,
+        path: Optional[str] = None,
     ) -> None:
         if int(input_size) <= 0:
             raise ValueError(f"input_size 必须是正整数，收到 {input_size}")
@@ -106,6 +108,9 @@ class SynapticaMemory:
         self.lateral_cfg = lateral_cfg or LateralConfig()
 
         self.segment_store = store
+        self.file: Optional[Any] = None
+        self._file_ids: Dict[int, List[int]] = {}
+        self._file_pending: Dict[int, bytes] = {}
 
         self.max_cached_segments = int(max_cached_segments)
         self._cache_order: List[int] = []
@@ -137,6 +142,7 @@ class SynapticaMemory:
         self._slot_ver: Dict[int, int] = {}
 
         self.segment_encoder: Optional[Any] = None
+        self.encoder_fp: str = ""
 
         self.pad_token_id: Optional[int] = None
 
@@ -156,6 +162,96 @@ class SynapticaMemory:
         self._c_pool_item: Dict[int, Tuple[int, Tuple[int, Tensor, Tensor]]] = {}
 
         self._c_pool_aux: Dict[Any, Tuple[List[Any], List[Any], set]] = {}
+
+        if path is not None:
+            self._open_file(str(path))
+
+    def _open_file(self, path: str) -> None:
+        from .memfile import MemoryFile
+
+        mf = MemoryFile.open(path) if os.path.exists(path) else MemoryFile.create(path)
+        self.file = mf
+        meta = dict(mf.meta or {})
+        self.encoder_fp = str(meta.get("encoder", "") or "")
+        if meta:
+            self.embedding_dim = int(meta.get("embedding_dim", 0))
+            self.token_dim = int(meta.get("token_dim", 0))
+            self.pattern_len = int(meta.get("pattern_len", 0))
+            self._token_dims = int(meta.get("token_dims", 0))
+        n = int(mf.num_slots)
+        if n > 0:
+            self.ensure_slots(n)
+            mem = mf.mem()
+            if mem is not None and int(mem.size) >= int(self.num_slots):
+                self.node.mem = torch.from_numpy(
+                    np.asarray(mem[: int(self.num_slots)], dtype=np.float32).copy()
+                ).to(self.node.mem.device)
+            (pos_s, pos_d, pos_v), (neg_s, neg_d, neg_v) = mf.edges()
+            pos_i = torch.stack([
+                torch.from_numpy(np.asarray(pos_s).copy()).long(),
+                torch.from_numpy(np.asarray(pos_d).copy()).long(),
+            ])
+            neg_i = torch.stack([
+                torch.from_numpy(np.asarray(neg_s).copy()).long(),
+                torch.from_numpy(np.asarray(neg_d).copy()).long(),
+            ])
+            if int(pos_i.shape[1]) > 0:
+                self.node.attach_lateral(cfg=self.lateral_cfg)
+                state: Dict[str, Any] = {
+                    "index": pos_i,
+                    "values": torch.from_numpy(np.asarray(pos_v).copy().astype("float32")),
+                    "edge_order": "src_dest",
+                    "config": self.lateral_cfg.to_json(),
+                }
+                if int(neg_i.shape[1]) > 0:
+                    state["neg_index"] = neg_i
+                    state["neg_values"] = torch.from_numpy(np.asarray(neg_v).copy().astype("float32"))
+                self.node.lateral = LateralState.load_state_dict(
+                    state, node=self.node
+                )
+        self._bump()
+
+    def check_encoder(self, fingerprint: str) -> None:
+        want = str(self.encoder_fp or "")
+        got = str(fingerprint or "")
+        if want and got and want != got:
+            raise ValueError(f"记忆文件的编码器指纹不一致：存档 {want} vs 当前 {got}")
+
+    def save(self, path: Optional[str] = None, **meta: Any) -> int:
+        if self.file is None:
+            if path is None:
+                raise RuntimeError("未配置文件：构造时传 path，或调用 save(path=...)")
+            self._open_file(str(path))
+        for slot, raw in list(self._file_pending.items()):
+            sid = int(slot)
+            self.file.append_segment(sid, self._file_ids.get(sid, []), raw)
+        self._file_pending.clear()
+
+        lat = self.node.lateral
+        if lat is None:
+            pos_i = torch.zeros(2, 0, dtype=torch.long)
+            pos_v = torch.zeros(0)
+            neg_i = torch.zeros(2, 0, dtype=torch.long)
+            neg_v = torch.zeros(0)
+        else:
+            pos_i = lat.index.detach().cpu().long()
+            pos_v = lat.values.detach().cpu().float()
+            neg_i = lat.neg_index.detach().cpu().long()
+            neg_v = lat.neg_values.detach().cpu().float()
+        epos = (pos_i[0], pos_i[1], pos_v)
+        eneg = (neg_i[0], neg_i[1], neg_v)
+        mem = self.node.mem.detach().cpu().float().numpy()
+        out_meta = {
+            "input_size": int(self.input_size),
+            "embedding_dim": int(self.embedding_dim),
+            "token_dim": int(self.token_dim),
+            "pattern_len": int(self.pattern_len),
+            "token_dims": int(self._token_dims),
+            "encoder": str(meta.get("encoder", "")),
+        }
+        self.file.save(out_meta, epos, eneg, mem)
+        self._bump()
+        return int(self.file.seq)
 
     def _bump(self) -> int:
         self._state_version = int(self._state_version) + 1
@@ -439,7 +535,13 @@ class SynapticaMemory:
                 self.n_pattern_hits = int(getattr(self, "n_pattern_hits", 0)) + 1
 
                 return int(_hit)
-        self.payloads[index] = array("i", (int(x) for x in ids))
+        if self.file is not None:
+            self._file_ids[index] = [int(x) for x in ids]
+            _bmp = self._pack_pattern_bitmap(_new_pattern)
+            if _bmp is not None:
+                self._file_pending[index] = _bmp
+        else:
+            self.payloads[index] = array("i", (int(x) for x in ids))
         self._slot_ver[index] = int(self._slot_ver.get(index, 0)) + 1
         self._touch_cache(index)
         if _new_pattern is not None:
@@ -452,6 +554,9 @@ class SynapticaMemory:
 
     def _next_free_slot(self) -> int:
         used = set(int(s) for s in self.payloads)
+        if self.file is not None:
+            used |= set(int(s) for s in self.file.slots())
+            used |= set(int(s) for s in self._file_ids)
         if self.segment_store is not None:
             used |= set(int(s) for s in self.segment_store.slots)
         i = 0
@@ -506,7 +611,25 @@ class SynapticaMemory:
             )
         return pat[:need].reshape(n_tok, int(k))
 
+    def _pack_pattern_bitmap(self, pat: Optional[Tensor]) -> Optional[bytes]:
+        if pat is None:
+            return None
+        bits = torch.as_tensor(pat).reshape(-1) != 0
+        packed = _pack_bits(bits)
+        raw = bytes(packed.contiguous().numpy().astype(np.uint8).tobytes())
+        if len(raw) < 1024:
+            raw = raw + b"\x00" * (1024 - len(raw))
+        return raw[:1024]
+
     def _cached_pattern(self, slot: int) -> Optional[Tensor]:
+        if self.file is not None:
+            raw = self.file.bitmap(int(slot))
+            if raw is not None:
+                n = int(self.pattern_len) or 8192
+                packed = torch.from_numpy(np.asarray(raw, dtype=np.uint8).copy())
+                bits = _unpack_bits(packed, n)
+                scale = float(bits.sum().item())
+                return bits / (scale if scale >= 1.0 else 1.0)
         hit = self._pattern_cache.get(int(slot))
         if hit is None:
             return None
@@ -656,6 +779,14 @@ class SynapticaMemory:
 
     def segment_token_ids(self, slot: int) -> Optional[List[int]]:
         s = int(slot)
+        pend = self._file_ids.get(s)
+        if pend is not None:
+            return [int(x) for x in pend]
+        if self.file is not None:
+            got = self.file.segment_ids(s)
+            if got is None:
+                return None
+            return [int(x) for x in got]
         p = self.payloads.get(s)
         if p is None and self.segment_store is not None:
             got = self.segment_store.read(s)
@@ -689,6 +820,8 @@ class SynapticaMemory:
 
     def find_by_pattern(self, pat) -> Optional[int]:
         key = self.pattern_key(pat)
+        if self.file is not None:
+            return self.file.lookup(key)
         slot = self._pattern_index.get(key)
         if slot is None:
             return None
@@ -699,6 +832,9 @@ class SynapticaMemory:
         return int(slot)
 
     def index_pattern(self, pat, slot: int) -> None:
+        if self.file is not None:
+            self.file.add_key(self.pattern_key(pat), int(slot))
+            return
         self._pattern_index[self.pattern_key(pat)] = int(slot)
 
     def pattern_index_size(self) -> int:
@@ -708,7 +844,9 @@ class SynapticaMemory:
         _ver, _cached = self._c_slots
         if int(_ver) == int(self._state_version):
             return _cached
-        if self.segment_store is not None:
+        if self.file is not None:
+            out = sorted(int(s) for s in self.file.slots())
+        elif self.segment_store is not None:
             out = [int(s) for s in self.segment_store.slots]
         else:
             out = sorted(int(s) for s in self.payloads)
@@ -717,6 +855,10 @@ class SynapticaMemory:
 
     def has_slot(self, slot: int) -> bool:
         s = int(slot)
+        if s in self._file_ids:
+            return True
+        if self.file is not None:
+            return bool(self.file.has(s))
         if s in self.payloads:
             return True
         return self.segment_store is not None and bool(self.segment_store.has(s))

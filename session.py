@@ -196,6 +196,9 @@ class Synaptica:
         )
 
         memory.bind_encoder(self._segment_encoder, self.encoder.segment_shape())
+        memory.check_encoder(
+            type(self.encoder).config_fingerprint_from(self.encoder.config_dict())
+        )
 
         memory.pad_token_id = getattr(self.backend, "pad_token_id", None)
         _tok = getattr(self.backend, "tokenizer", None)
@@ -222,6 +225,10 @@ class Synaptica:
             "encoder": self.encoder.state_dict(),
         }
 
+    def save(self, path: str) -> int:
+        fp = type(self.encoder).config_fingerprint_from(self.encoder.config_dict())
+        return int(self.memory.save(str(path), encoder=fp))
+
     def load_state_dict(self, state: Dict[str, Any]) -> "Synaptica":
         enc_state = state["encoder"]
         want = type(self.encoder).config_fingerprint_from(self.encoder.config_dict())
@@ -235,6 +242,9 @@ class Synaptica:
         self.memory.load_state_dict(state["memory"])
 
         self.memory.bind_encoder(self._segment_encoder, self.encoder.segment_shape())
+        self.memory.check_encoder(
+            type(self.encoder).config_fingerprint_from(self.encoder.config_dict())
+        )
         return self
 
     def _install_token_len_fn(self) -> None:

@@ -82,6 +82,7 @@ All arguments are keyword arguments.
 | `reset()`                                                           | Clears memory, lateral edges and caches                                                                                                         |
 | `stats(result=None)`                                                | Returns a statistics dict                                                                                                                       |
 | `state_dict()` / `load_state_dict(state)`                           | Memory and encoder archive; loading verifies the encoder config fingerprint                                                                     |
+| `save(path)`                                                        | Write the memory into a single file (see `path` on `SynapticaMemory`)                              |
 
 ### `SynapticaConfig`
 
@@ -107,7 +108,9 @@ All arguments are keyword arguments.
 
 ### `SynapticaMemory(input_size, num_slots, *, ...)`
 
-`input_size` must equal the encoder's `num_neurons`; `num_slots` is the initial slot capacity and grows on demand as content is written. Remaining keywords: `device=None`, `lateral_cfg=None`, `store=None`, `max_cached_segments=0`. `lateral_cfg` controls lateral edges and recall; `store` can be a `SegmentStore` for on-disk segments.
+`input_size` must equal the encoder's `num_neurons`; `num_slots` is the initial slot capacity and grows on demand as content is written. Remaining keywords: `device=None`, `lateral_cfg=None`, `store=None`, `max_cached_segments=0`, `path=None`. `lateral_cfg` controls lateral edges and recall; `store` can be a `SegmentStore` for on-disk segments.
+
+`path` points at a single-file memory: a missing file is created, an existing one loads `mem`, lateral edges, the dedup index and metadata, while segment ids and pattern bitmaps stay in the file and are read on demand through `mmap`. Writes stay in session memory until `save(path=None)` commits them; each commit writes a CRC-checked commit slot (two slots used alternately), so a truncated file falls back to the previous commit. The encoder projection is not stored and is rebuilt from `pulse_seed`; the file records the encoder fingerprint in META and loading fails when the session's fingerprint differs.
 
 ### `LateralConfig`
 

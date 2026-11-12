@@ -82,6 +82,7 @@ InfiniteBench:
 | `reset()`                                                           | 清空记忆、侧向边与缓存                                                                          |
 | `stats(result=None)`                                                | 返回统计字典                                                                                    |
 | `state_dict()` / `load_state_dict(state)`                           | 记忆与编码器存档；装载时校验编码器配置指纹                                                      |
+| `save(path)`                                                        | 把记忆写入单文件（见 `SynapticaMemory` 的 `path` 参数）                                          |
 
 ### `SynapticaConfig`
 
@@ -107,7 +108,9 @@ InfiniteBench:
 
 ### `SynapticaMemory(input_size, num_slots, *, ...)`
 
-`input_size` 必须等于编码器的 `num_neurons`；`num_slots` 为初始槽位容量，写入时按需扩容。其余关键字参数：`device=None`、`lateral_cfg=None`、`store=None`、`max_cached_segments=0`。`lateral_cfg` 决定侧向边与召回参数，`store` 可换成 `SegmentStore` 做磁盘落盘。
+`input_size` 必须等于编码器的 `num_neurons`；`num_slots` 为初始槽位容量，写入时按需扩容。其余关键字参数：`device=None`、`lateral_cfg=None`、`store=None`、`max_cached_segments=0`、`path=None`。`lateral_cfg` 决定侧向边与召回参数，`store` 可换成 `SegmentStore` 做磁盘落盘。
+
+`path` 指向单文件记忆：文件不存在则新建，存在则载入 `mem`、侧向边、去重索引与元数据，段内容与段模式位图留在文件里由 `mmap` 按需读取。写入落在会话内存中，调用 `save(path=None)` 提交；每次提交写一个带 CRC 的 commit 槽（双槽交替），被截断的文件回落到上一个 commit。编码器投影不存档，由 `pulse_seed` 重建；文件 META 里记录编码器指纹，装载时会话若指纹不符则报错。
 
 ### `LateralConfig`
 
