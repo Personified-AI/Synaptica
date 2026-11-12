@@ -5,6 +5,7 @@ from dataclasses import asdict, dataclass, field
 from array import array
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
+import numpy as np
 import torch
 from torch import Tensor
 
@@ -15,6 +16,7 @@ from .store import SegmentStore, as_token_ids
 __all__ = ["RecallResult", "WriteStats", "PatternPrep", "SynapticaMemory"]
 
 _BIT_W = (1, 2, 4, 8, 16, 32, 64, 128)
+_POOL_CHUNK = 8192
 
 
 def _pack_bits(bits: Tensor) -> Tensor:
@@ -28,10 +30,31 @@ def _pack_bits(bits: Tensor) -> Tensor:
 
 
 def _unpack_bits(packed: Tensor, n: int) -> Tensor:
+    if packed.device.type == "cpu":
+        _arr = np.frombuffer(packed.contiguous().numpy().tobytes(), dtype=np.uint8)
+        out = np.unpackbits(_arr, bitorder="little")[: int(n)]
+        return torch.from_numpy(out.copy()).to(torch.float32)
     col = packed.to(torch.int64).reshape(-1, 1)
     shifts = torch.arange(8, dtype=torch.int64)
     out = ((col >> shifts) & 1).reshape(-1)[: int(n)]
     return out.to(torch.float32)
+
+
+def _sparse_add(ai: Tensor, av: Tensor, bi: Tensor,
+                bv: Tensor) -> Tuple[Tensor, Tensor]:
+    if int(ai.numel()) == 0:
+        return bi, bv
+    if int(bi.numel()) == 0:
+        return ai, av
+    k = torch.cat([ai, bi])
+    v = torch.cat([av, bv])
+    order = torch.argsort(k, stable=True)
+    k, v = k[order], v[order]
+    uniq, inv = torch.unique_consecutive(k, return_inverse=True)
+    acc = torch.zeros(int(uniq.numel()), dtype=v.dtype, device=v.device)
+    acc.index_add_(0, inv, v)
+    keep = acc != 0
+    return uniq[keep], acc[keep]
 
 class PatternPrep:
 
@@ -110,7 +133,8 @@ class SynapticaMemory:
 
         self._token_dims: int = 0
 
-        self._pattern_cache: Dict[int, Tuple[Tuple[int, ...], Any, float, int, Any]] = {}
+        self._pattern_cache: Dict[int, Tuple[int, Any, float, int, Any]] = {}
+        self._slot_ver: Dict[int, int] = {}
 
         self.segment_encoder: Optional[Any] = None
 
@@ -131,7 +155,7 @@ class SynapticaMemory:
 
         self._c_pool_item: Dict[int, Tuple[int, Tuple[int, Tensor, Tensor]]] = {}
 
-        self._c_pool_aux: Dict[Any, Tuple[List[Any], List[Any], List[Any], set]] = {}
+        self._c_pool_aux: Dict[Any, Tuple[List[Any], List[Any], set]] = {}
 
     def _bump(self) -> int:
         self._state_version = int(self._state_version) + 1
@@ -261,7 +285,7 @@ class SynapticaMemory:
         lat = self.node.lateral
         if lat is None or lat.num_edges == 0:
             return False
-        m = (lat.index[0] == int(dest)) & (lat.index[1] == int(src))
+        m = (lat.index[1] == int(dest)) & (lat.index[0] == int(src))
         return bool(m.any())
 
     def add_negative_laterals(
@@ -347,6 +371,8 @@ class SynapticaMemory:
         }
 
         self._cache_order = sorted(self.payloads)
+        self._pattern_cache.clear()
+        self._slot_ver.clear()
         self.embedding_dim = int(state["embedding_dim"])
         self.token_dim = int(state["token_dim"])
         self.pattern_len = int(state.get("pattern_len", 0))
@@ -367,17 +393,19 @@ class SynapticaMemory:
         self._bump()
         return self
 
-    def store(self, payload: Any, index: Optional[int] = None) -> int:
+    def store(self, payload: Any, index: Optional[int] = None, *,
+              pattern: Optional[Tensor] = None) -> int:
 
         if index is not None:
             self._pattern_cache.pop(int(index), None)
-        idx = self.store_payload_only(payload, index)
+        idx = self.store_payload_only(payload, index, pattern=pattern)
         ids = self.segment_token_ids(idx) or []
         if ids:
             self.observe_tokens(ids)
         return idx
 
-    def store_payload_only(self, payload: Any, index: Optional[int] = None) -> int:
+    def store_payload_only(self, payload: Any, index: Optional[int] = None, *,
+                           pattern: Optional[Tensor] = None) -> int:
 
         _auto_slot = index is None
         if index is None:
@@ -394,7 +422,10 @@ class SynapticaMemory:
         if _auto_slot:
             try:
 
-                _new_pattern = self._encode(ids)[1]
+                if pattern is None:
+                    _new_pattern = self._encode(ids)[1]
+                else:
+                    _new_pattern = torch.as_tensor(pattern).reshape(-1)
                 _hit = self.find_by_pattern(_new_pattern)
             except Exception as _exc:
 
@@ -408,8 +439,8 @@ class SynapticaMemory:
                 self.n_pattern_hits = int(getattr(self, "n_pattern_hits", 0)) + 1
 
                 return int(_hit)
-            index = self._next_free_slot()
         self.payloads[index] = array("i", (int(x) for x in ids))
+        self._slot_ver[index] = int(self._slot_ver.get(index, 0)) + 1
         self._touch_cache(index)
         if _new_pattern is not None:
             self.index_pattern(_new_pattern, int(index))
@@ -462,7 +493,7 @@ class SynapticaMemory:
         k = self.token_dims
         if k <= 0:
             raise RuntimeError("token_dims 未确定：注入编码器时须先建立段长与模式维度的整除关系")
-        pat = self._cached_pattern(slot, ids)
+        pat = self._cached_pattern(slot)
         if pat is None:
             pat = self._encode(ids)[1]
 
@@ -475,12 +506,12 @@ class SynapticaMemory:
             )
         return pat[:need].reshape(n_tok, int(k))
 
-    def _cached_pattern(self, slot: int, ids: Sequence[int]) -> Optional[Tensor]:
+    def _cached_pattern(self, slot: int) -> Optional[Tensor]:
         hit = self._pattern_cache.get(int(slot))
         if hit is None:
             return None
-        fp, packed, scale, n, dense = hit
-        if tuple(int(x) for x in ids) != fp:
+        ver, packed, scale, n, dense = hit
+        if int(self._slot_ver.get(int(slot), 0)) != ver:
             return None
         if dense is not None:
             return dense
@@ -497,7 +528,7 @@ class SynapticaMemory:
         recon = _unpack_bits(packed, n) / scale
         keep = None if torch.equal(recon, dense) else dense
         self._pattern_cache[int(slot)] = (
-            tuple(int(x) for x in ids),
+            int(self._slot_ver.get(int(slot), 0)),
             packed,
             scale,
             n,
@@ -538,7 +569,7 @@ class SynapticaMemory:
         n = 0
         for slot in self.stored_segments():
             ids = self.segment_token_ids(slot) or []
-            if not ids or self._cached_pattern(slot, ids) is not None:
+            if not ids or self._cached_pattern(slot) is not None:
                 continue
 
             pat = self.prepare(self._encode(ids)[1])
@@ -554,20 +585,70 @@ class SynapticaMemory:
                             dtype=torch.float32)
 
     def _recall_pool_aux(self, pool: Sequence[int], scope: Optional[Sequence[int]]
-                         ) -> Tuple[List[Any], List[Any], List[Any], set]:
+                         ) -> Tuple[List[Any], List[Any], set]:
         _key = (int(self._state_version), tuple(int(s) for s in pool))
         _hit = self._c_pool_aux.get(_key)
         if _hit is not None:
             return _hit
-        pool_items = [self._pool_item(int(s)) for s in pool]
         _cand_valid = [self.valid_len(self.segment_token_ids(int(s))) for s in pool]
         _cand_ids = [self.segment_token_ids(int(s)) or [] for s in pool]
         _bad_ids = set(int(x) for x in (getattr(self, "special_token_ids", None) or ()))
-        out = (pool_items, _cand_valid, _cand_ids, _bad_ids)
+        out = (_cand_valid, _cand_ids, _bad_ids)
         if len(self._c_pool_aux) >= 8:
             self._c_pool_aux.clear()
         self._c_pool_aux[_key] = out
         return out
+
+    def _recall_pool_ranked(
+        self,
+        query_tokens: Tensor,
+        pool: Sequence[int],
+        *,
+        matcher: SeqMatcher,
+        k: int,
+        freq_q: Optional[Tensor] = None,
+        query_valid: Optional[int] = None,
+        scope: Optional[Sequence[int]] = None,
+    ) -> Optional[Tuple[List[Tuple[int, float, int]], List[int], Tensor, Tensor]]:
+        _cand_valid, _cand_ids, _bad_ids = self._recall_pool_aux(pool, scope)
+        _tops: List[Tuple[int, float, int]] = []
+        _slots: List[int] = []
+        _scores: List[Tensor] = []
+        _lens: List[Tensor] = []
+        _step = max(1, int(_POOL_CHUNK))
+        for _i in range(0, len(pool), _step):
+            _chunk = pool[_i:_i + _step]
+            _n_chunk = len(_chunk)
+            _items = [self._pool_item(int(s)) for s in _chunk]
+            _got = matcher._score_pool(
+                query_tokens,
+                _items,
+                freq_q=freq_q,
+                query_valid=query_valid,
+                cand_valid=_cand_valid[_i:_i + _n_chunk],
+                cand_ids=_cand_ids[_i:_i + _n_chunk],
+                bad_ids=_bad_ids,
+            )
+            del _items
+            self._c_pool_item.clear()
+            matcher._cand_cache.clear()
+            matcher._sp_cache.clear()
+            if _got is None:
+                return None
+            _csl, _csc, _cln = _got
+            _slots.extend(int(x) for x in _csl)
+            _scores.append(_csc)
+            _lens.append(_cln)
+            _kk = min(max(0, int(k)), int(_csc.numel()))
+            if _kk > 0:
+                _vals, _idx = torch.topk(_csc, _kk)
+                _tops.extend((int(_csl[int(_b)]), float(_vals[_j]), int(_cln[int(_b)]))
+                             for _j, _b in enumerate(_idx.tolist()))
+        _keep = min(max(0, int(k)), len(_tops))
+        if len(pool) <= _step:
+            return (_tops[:_keep], _slots, torch.cat(_scores), torch.cat(_lens))
+        _tops.sort(key=lambda _a: -_a[1])
+        return (_tops[:_keep], _slots, torch.cat(_scores), torch.cat(_lens))
 
     @property
     def _segment_token_ids(self) -> Dict[int, List[int]]:
@@ -580,6 +661,7 @@ class SynapticaMemory:
             got = self.segment_store.read(s)
             if got is not None:
                 self.payloads[s] = array("i", (int(x) for x in got))
+                self._slot_ver[s] = int(self._slot_ver.get(s, 0)) + 1
                 self._touch_cache(s)
                 p = self.payloads[s]
         if p is None:
@@ -592,7 +674,7 @@ class SynapticaMemory:
         ids = self.segment_token_ids(slot)
         if not ids:
             return None
-        pat = self._cached_pattern(int(slot), ids)
+        pat = self._cached_pattern(int(slot))
         if pat is None:
 
             pat = self.prepare(self._encode(ids)[1])
@@ -725,7 +807,8 @@ class SynapticaMemory:
 
         matcher.score_device = None
 
-        pool_items, _cand_valid, _cand_ids, _bad_ids = self._recall_pool_aux(pool, scope)
+        _scan: Optional[Tuple[
+            List[Tuple[int, float, int]], List[int], Tensor, Tensor]] = None
 
         if query_slot_hint is not None:
 
@@ -735,16 +818,13 @@ class SynapticaMemory:
             _anchors = [(_h, 1.0, int(_hl))]
         elif force_anchor is not None:
             _anchors = [(int(force_anchor[0]), float(force_anchor[1]), int(force_anchor[2]))]
-        elif int(ref_anchor_k) > 1:
-            _anchors = [a for a in matcher.top_of(
-                query_tokens, pool_items, k=int(ref_anchor_k), freq_q=query_freq,
-                query_valid=query_valid, cand_valid=_cand_valid,
-                cand_ids=_cand_ids, bad_ids=_bad_ids) if float(a[1]) > 0.0]
         else:
-            _one = matcher.best_of(query_tokens, pool_items, freq_q=query_freq,
-                                   query_valid=query_valid, cand_valid=_cand_valid,
-                cand_ids=_cand_ids, bad_ids=_bad_ids)
-            _anchors = [] if _one is None else [a for a in [_one] if float(a[1]) > 0.0]
+            _scan = self._recall_pool_ranked(
+                query_tokens, pool, matcher=matcher,
+                k=(int(ref_anchor_k) if int(ref_anchor_k) > 1 else 1),
+                freq_q=query_freq, query_valid=query_valid, scope=scope)
+            _anchors = [] if _scan is None else [
+                a for a in _scan[0] if float(a[1]) > 0.0]
         if not _anchors:
             out["n_miss"] = 1
             return out
@@ -759,12 +839,12 @@ class SynapticaMemory:
         _slot_gain = None
         _kz = float(getattr(self.lateral_cfg, "pfc_z_coef", 0.0))
         if _kz > 0.0 and len(_anchors) > 0:
-            _sp = matcher._score_pool(
-                query_tokens, pool_items, freq_q=query_freq,
-                query_valid=query_valid, cand_valid=_cand_valid,
-                cand_ids=_cand_ids, bad_ids=_bad_ids)
-            if _sp is not None:
-                _sl, _sc, _ln = _sp
+            if _scan is None:
+                _scan = self._recall_pool_ranked(
+                    query_tokens, pool, matcher=matcher, k=1,
+                    freq_q=query_freq, query_valid=query_valid, scope=scope)
+            if _scan is not None:
+                _sl, _sc, _ln = _scan[1], _scan[2], _scan[3]
                 _sl = [int(x) for x in _sl]
                 _sc = torch.as_tensor(_sc, dtype=torch.float32)
                 _ln = torch.as_tensor(_ln, dtype=torch.float32)
@@ -985,49 +1065,71 @@ class SynapticaMemory:
                 _u = torch.where(_u > 0, _u, torch.full_like(_u, _ref))
                 _thr_t = (_ref / _u).clamp(0.1, 10.0)
 
+        _mb = float(self.lateral_cfg.mem_beta)
+        _dtype = self.node.mem.dtype
+        lat = self.node.lateral
+        mem = torch.zeros(num, dtype=_dtype, device=dev)
+        peak = torch.zeros(num, dtype=_dtype, device=dev)
+        seen = torch.zeros(num, dtype=_dtype, device=dev)
+        out = torch.zeros(num, dtype=_dtype, device=dev)
+        s_prev = torch.zeros(num, dtype=_dtype, device=dev)
+        s_prev[idx] = 1.0
+        touched = torch.unique(idx)
+        frontier = touched
+        n_seen = 0
+
         for t in range(int(steps)):
-
-            _s_drv = s_prev if slot_gain is None else s_prev * _gain
-            if slot_gain is not None:
-                lat = (self.node.lateral.propagate(
-                           _s_drv, positive_only=True)
-                       + self.node.lateral.propagate(
-                           s_prev, negative_only=True))
+            if slot_gain is None:
+                di, dv = lat.spread(frontier, s_prev)
             else:
-                lat = self.node.lateral.propagate(_s_drv)
+                _ai, _av = lat.spread(frontier, s_prev, positive_only=True, gain=_gain)
+                _bi, _bv = lat.spread(frontier, s_prev, negative_only=True)
+                di, dv = _sparse_add(_ai, _av, _bi, _bv)
 
-            if t > 0 and float(lat.abs().sum()) == 0.0:
+            if t > 0 and (int(di.numel()) == 0 or float(dv.abs().sum()) == 0.0):
                 break
 
-            _mb = float(self.lateral_cfg.mem_beta)
-            mem = _mb * self.node.mem + lat
-            peak = torch.maximum(peak, mem.abs())
-            thr = self._threshold(mem, written, fire_ratio=float(fire_ratio),
-                                  fire_theta=fire_theta)
+            if int(di.numel()):
+                mem.index_copy_(0, touched, mem[touched] * _mb)
+                mem.index_add_(0, di, dv)
+                touched = torch.unique(torch.cat([touched, di]))
+
+            peak.index_copy_(
+                0, touched, torch.maximum(peak[touched], mem[touched].abs())
+            )
             if _thr_t is not None:
-                thr = _thr_t * float(fire_theta)
-            _thr_vec = thr if torch.is_tensor(thr) else torch.full_like(seen, float(thr))
+                _tv = _thr_t[touched] * float(fire_theta)
+            else:
+                _thr = self._threshold(mem, written, fire_ratio=float(fire_ratio),
+                                       fire_theta=None)
+                _tv = torch.full((int(touched.numel()),), float(_thr),
+                                 dtype=_dtype, device=dev)
             if slot_gain is not None:
-                _thr_vec = _thr_vec / _gain
+                _tv = _tv / _gain[touched]
 
-            spk = (mem > _thr_vec).to(self.node.mem.dtype) * _thr_vec
+            spk = (mem[touched] > _tv).to(_dtype) * _tv
             if int(t) == 0:
-
-                spk[idx] = 1.0
-            spk = spk * (1.0 - seen)
+                spk = torch.where(torch.isin(touched, idx), torch.ones_like(spk), spk)
+            spk = spk * (1.0 - seen[touched])
 
             if _ubmask is not None:
-                spk = spk * _ubmask.to(spk.dtype)
-            seen = torch.clamp(seen + (spk > 0).to(seen.dtype), 0.0, 1.0)
-            out = torch.clamp(out + spk, 0.0, 1.0)
+                spk = spk * _ubmask[touched].to(spk.dtype)
+            seen.index_copy_(
+                0, touched, torch.clamp(seen[touched] + (spk > 0).to(_dtype), 0.0, 1.0)
+            )
+            out.index_copy_(0, touched, torch.clamp(out[touched] + spk, 0.0, 1.0))
+            mem.index_copy_(0, touched, mem[touched] * (1.0 - spk))
 
-            self.node.mem = mem * (1.0 - spk)
-            s_prev = spk
-            if float(s_prev.abs().sum()) == 0:
+            _nz = spk > 0
+            frontier = touched[_nz]
+            s_prev.index_copy_(0, touched, spk)
+            if int(frontier.numel()) == 0:
                 break
-            if float(seen.sum()) >= int(max_fired):
+            n_seen += int(frontier.numel())
+            if n_seen >= int(max_fired):
                 break
 
+        self.node.mem = mem
         order = [int(i) for i in out.nonzero().flatten().tolist()]
         scores = [float(peak[i]) for i in order]
         return RecallResult(

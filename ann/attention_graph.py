@@ -20,18 +20,12 @@ class AttentionGraphConfig:
 class AttentionGraph:
 
     def __init__(self, rows: Sequence[EdgeRow], spans: Sequence[Span],
-                 *, meta: Optional[Dict[str, Any]] = None,
-                 col_mass: Optional[Tensor] = None,
-                 token_row_max: Optional[Tensor] = None,
-                 row_negent: Optional[Tensor] = None) -> None:
+                 *, meta: Optional[Dict[str, Any]] = None) -> None:
         if len(rows) != len(spans):
             raise ValueError("rows 数量必须等于 spans 数量")
         self.rows: List[EdgeRow] = [list(r) for r in rows]
         self.spans: List[Span] = [(int(a), int(b)) for a, b in spans]
         self.meta: Dict[str, Any] = dict(meta or {})
-        self.col_mass: Optional[Tensor] = col_mass
-        self.token_row_max: Optional[Tensor] = token_row_max
-        self.row_negent: Optional[Tensor] = row_negent
 
     @property
     def num_slots(self) -> int:
@@ -94,9 +88,6 @@ class SegmentAggregator:
         self.T = int(num_rows)
         self.M = len(self.spans)
         self.W = torch.zeros(self.M, self.M, dtype=torch.float32)
-        self.col_mass = torch.zeros(self.T, dtype=torch.float32)
-        self.token_row_max = torch.zeros(self.T, dtype=torch.float32)
-        self.row_negent = torch.zeros(self.T, dtype=torch.float32)
         seg = torch.full((self.T,), -1, dtype=torch.long)
         for j, (c, d) in enumerate(self.spans):
             seg[c:d] = j
@@ -152,13 +143,6 @@ class SegmentAggregator:
             self._rows_seen += n
             return
         rseg, rows_g = rseg[keep], rows_g[keep]
-        _rpos = torch.nonzero(keep, as_tuple=False).flatten() + int(offset)
-        self.col_mass += rows_g.sum(dim=0).cpu()
-        self.token_row_max.index_copy_(0, _rpos, rows_g.max(dim=1).values.cpu())
-        _rsum = rows_g.sum(dim=1, keepdim=True)
-        _rsum_safe = torch.where(_rsum > 0, _rsum, torch.ones_like(_rsum))
-        _p = rows_g / _rsum_safe
-        self.row_negent.index_copy_(0, _rpos, torch.xlogy(_p, _p).sum(dim=1).cpu())
         colred = self._col_sum_gpu(rows_g).float().cpu()
         self.W.index_add_(0, rseg, colred)
         self._rows_seen += n
@@ -167,12 +151,7 @@ class SegmentAggregator:
     def finalize(self, *, meta: Optional[Dict[str, Any]] = None) -> AttentionGraph:
         W = self.W.clone()
         spans = list(self.spans)
-        T = self.T
-        col_mass = self.col_mass[0:T].clone()
-        token_row_max = self.token_row_max[0:T].clone()
-        row_negent = self.row_negent[0:T].clone()
-        return graph_from_W(W, spans, self.cfg, meta=meta, T=T, col_mass=col_mass,
-                            token_row_max=token_row_max, row_negent=row_negent)
+        return graph_from_W(W, spans, self.cfg, meta=meta, T=self.T)
 
 
 def apply_baseline_and_causal(W: Tensor, spans: Sequence[Span],
@@ -189,10 +168,7 @@ def apply_baseline_and_causal(W: Tensor, spans: Sequence[Span],
 def graph_from_W(W: Tensor, spans: Sequence[Span],
                  cfg: Optional[AttentionGraphConfig] = None,
                  *, T: Optional[int] = None,
-                 meta: Optional[Dict[str, Any]] = None,
-                 col_mass: Optional[Tensor] = None,
-                 token_row_max: Optional[Tensor] = None,
-                 row_negent: Optional[Tensor] = None) -> AttentionGraph:
+                 meta: Optional[Dict[str, Any]] = None) -> AttentionGraph:
     cfg = cfg or AttentionGraphConfig()
     spans = validate_spans(spans, int(T) if T is not None else max(b for _a, b in spans))
     M = len(spans)
@@ -229,16 +205,15 @@ def graph_from_W(W: Tensor, spans: Sequence[Span],
 
     rows: List[EdgeRow] = [[] for _ in range(M)]
     _cand: List[Tuple[float, int, int]] = []
-    _Wp = W
-    for _i in range(M):
-        for _j in range(M):
-            if _i == _j:
-                continue
-            _w2 = float(_Wp[_i][_j])
-            if _w2 <= 0.0:
-                continue
-            _cand.append((_w2, int(_j), int(_i)))
-            _cand.append((_w2, int(_i), int(_j)))
+    _Wrows = W.tolist()
+    for _i, _j in torch.nonzero(W, as_tuple=False).tolist():
+        if _i == _j:
+            continue
+        _w2 = _Wrows[_i][_j]
+        if _w2 <= 0.0:
+            continue
+        _cand.append((_w2, int(_j), int(_i)))
+        _cand.append((_w2, int(_i), int(_j)))
     _oc: Dict[int, int] = {}
     _ic: Dict[int, int] = {}
     _sel: List[Tuple[int, int, float]] = []
@@ -269,5 +244,4 @@ def graph_from_W(W: Tensor, spans: Sequence[Span],
                     _W_raw[int(_tgt), int(_att)].item()))
 
     meta["raw_pairs"] = _raw_pairs
-    return AttentionGraph(merged, spans, meta=meta, col_mass=col_mass,
-                          token_row_max=token_row_max, row_negent=row_negent)
+    return AttentionGraph(merged, spans, meta=meta)

@@ -734,8 +734,8 @@ class Synaptica:
             if q_slots:
                 ex = set(
                     zip(
-                        self.memory.laterals_index[0].tolist(),
                         self.memory.laterals_index[1].tolist(),
+                        self.memory.laterals_index[0].tolist(),
                     )
                 )
                 d_new: List[int] = []
@@ -1030,6 +1030,7 @@ class Synaptica:
                     self.memory.store(
                         tuple(int(x) for x in blk[a:b]),
                         None,
+                        pattern=emb["patterns"][i],
                     )
                 )
             )

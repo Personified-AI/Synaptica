@@ -82,6 +82,8 @@ class LateralState:
 
         self.neg_index = torch.zeros(2, 0, dtype=torch.long, device=self.device)
         self.neg_values = torch.zeros(0, dtype=torch.float32, device=self.device)
+        self._csr_cache: Optional[Tuple[Tensor, Tensor, Tensor]] = None
+        self._neg_csr_cache: Optional[Tuple[Tensor, Tensor, Tensor]] = None
         self._standalone_slots = (
             (int(self.index.max().item()) + 1) if self.index.numel() else 1
         )
@@ -111,8 +113,8 @@ class LateralState:
                                   self.neg_index[1].tolist(),
                                   self.neg_values.tolist()):
                 _cur[int(_a) * _n + int(_b)] = float(_v)
-        for _a, _b, _v in zip(dest.tolist(), src.tolist(), vals.tolist()):
-            _k = int(_a) * _n + int(_b)
+        for _d, _s, _v in zip(dest.tolist(), src.tolist(), vals.tolist()):
+            _k = int(_s) * _n + int(_d)
             _nv = _cur.get(_k, 0.0) + float(_v)
             _nv = min(-1e-12, max(-_cap, _nv))
             _cur[_k] = _nv
@@ -124,6 +126,7 @@ class LateralState:
         self.neg_values = torch.tensor(
             [_cur[_k] for _k in _ks], dtype=torch.float32, device=self.device
         ) if _ks else torch.zeros(0, dtype=torch.float32, device=self.device)
+        self._neg_csr_cache = None
         return len(_ks)
 
     def _neg_cap(self) -> float:
@@ -132,7 +135,7 @@ class LateralState:
     def fanin(self) -> Tensor:
         out = torch.zeros(self.num_slots, device=self.device)
         if self.num_edges:
-            out.scatter_add_(0, self.index[0], self.values.abs())
+            out.scatter_add_(0, self.index[1], self.values.abs())
         return out
 
     def count_edges(self, dest: Sequence[int], src: Sequence[int]) -> int:
@@ -140,7 +143,7 @@ class LateralState:
             return 0
         ds, ss = set(int(x) for x in dest), set(int(x) for x in src)
         n = 0
-        for d, s in zip(self.index[0].tolist(), self.index[1].tolist()):
+        for s, d in zip(self.index[0].tolist(), self.index[1].tolist()):
             if int(d) in ds and int(s) in ss:
                 n += 1
         return n
@@ -148,52 +151,129 @@ class LateralState:
     def edges(self) -> List[Tuple[int, int, float]]:
         return [
             (int(d), int(s), 1.0)
-            for d, s in zip(self.index[0].tolist(), self.index[1].tolist())
+            for s, d in zip(self.index[0].tolist(), self.index[1].tolist())
         ]
 
-    def propagate(self, spikes: Tensor, *, reverse: bool = False,
-                  positive_only: bool = False, negative_only: bool = False) -> Tensor:
-        spk = spikes.float().to(self.device).reshape(-1)
-        if spk.numel() != self.num_slots:
-            raise ValueError(f"spikes 长度 {spk.numel()} 与 num_slots {self.num_slots} 不一致")
-        if self.num_edges == 0:
-            return torch.zeros_like(spk)
-        _neg_spk = None
-        if self.neg_index.shape[1]:
-            _nmat = torch.sparse_coo_tensor(
-                self.neg_index, self.neg_values,
-                (self.num_slots, self.num_slots), device=self.device,
-            ).coalesce()
-            _neg_spk = torch.sparse.mm(
-                _nmat.transpose(0, 1) if reverse else _nmat, spk.unsqueeze(1)
-            ).squeeze(1)
-        if bool(negative_only):
-            _wneg = self.values.clamp_max(0.0)
-            _mneg = torch.sparse_coo_tensor(
-                self.index, _wneg,
-                (self.num_slots, self.num_slots), device=self.device,
-            ).coalesce()
-            _mneg = _mneg.transpose(0, 1) if reverse else _mneg
-            _outn = torch.sparse.mm(_mneg, spk.unsqueeze(1)).squeeze(1)
-            if _neg_spk is not None:
-                _outn = _outn + _neg_spk
-            return _outn
-        if bool(positive_only):
-            _w = self.values.clamp_min(0.0)
-        else:
-            _w = self.values
-        mat = torch.sparse_coo_tensor(
-            self.index,
-            _w,
-            (self.num_slots, self.num_slots),
-            device=self.device,
-        ).coalesce()
+    def _csr(self) -> Tuple[Tensor, Tensor, Tensor]:
+        if self._csr_cache is None:
+            if self.num_edges == 0:
+                self._csr_cache = (
+                    torch.zeros(self.num_slots + 1, dtype=torch.long, device=self.device),
+                    torch.zeros(0, dtype=torch.long, device=self.device),
+                    torch.zeros(0, dtype=self.values.dtype, device=self.device),
+                )
+            else:
+                order = torch.argsort(self.index[0], stable=True)
+                src = self.index[0][order]
+                indptr = torch.cat([
+                    torch.zeros(1, dtype=torch.long, device=self.device),
+                    torch.bincount(src, minlength=self.num_slots).cumsum(0),
+                ])
+                self._csr_cache = (indptr, self.index[1][order], self.values[order])
+        return self._csr_cache
 
-        m = mat.transpose(0, 1) if reverse else mat
-        _out = torch.sparse.mm(m, spk.unsqueeze(1)).squeeze(1)
-        if _neg_spk is not None and not bool(positive_only):
-            _out = _out + _neg_spk
-        return _out
+    def _neg_csr(self) -> Tuple[Tensor, Tensor, Tensor]:
+        if self._neg_csr_cache is None:
+            if self.neg_index.shape[1] == 0:
+                self._neg_csr_cache = (
+                    torch.zeros(self.num_slots + 1, dtype=torch.long, device=self.device),
+                    torch.zeros(0, dtype=torch.long, device=self.device),
+                    torch.zeros(0, dtype=self.neg_values.dtype, device=self.device),
+                )
+            else:
+                order = torch.argsort(self.neg_index[0], stable=True)
+                src = self.neg_index[0][order]
+                indptr = torch.cat([
+                    torch.zeros(1, dtype=torch.long, device=self.device),
+                    torch.bincount(src, minlength=self.num_slots).cumsum(0),
+                ])
+                self._neg_csr_cache = (
+                    indptr, self.neg_index[1][order], self.neg_values[order],
+                )
+        return self._neg_csr_cache
+
+    def gather(self, frontier: Tensor, *, table: str = "pos") -> Tuple[Tensor, Tensor, Tensor]:
+        indptr, dest, vals = self._csr() if table == "pos" else self._neg_csr()
+        if int(frontier.numel()) == 0 or int(dest.numel()) == 0:
+            z = torch.zeros(0, dtype=torch.long, device=self.device)
+            return z, z, torch.zeros(0, dtype=self.values.dtype, device=self.device)
+        lo = indptr[frontier]
+        hi = indptr[frontier + 1]
+        cnt = hi - lo
+        total = int(cnt.sum())
+        if total == 0:
+            z = torch.zeros(0, dtype=torch.long, device=self.device)
+            return z, z, torch.zeros(0, dtype=self.values.dtype, device=self.device)
+        base = torch.cumsum(cnt, 0) - cnt
+        flat = torch.repeat_interleave(lo, cnt) + (
+            torch.arange(total, device=self.device) - torch.repeat_interleave(base, cnt)
+        )
+        return dest[flat], torch.repeat_interleave(frontier, cnt), vals[flat]
+
+    def spread(
+        self,
+        frontier: Tensor,
+        driver: Tensor,
+        *,
+        positive_only: bool = False,
+        negative_only: bool = False,
+        gain: Optional[Tensor] = None,
+    ) -> Tuple[Tensor, Tensor]:
+        num = int(self.num_slots)
+        if self.num_edges == 0:
+            return (
+                torch.zeros(0, dtype=torch.long, device=self.device),
+                torch.zeros(0, dtype=self.values.dtype, device=self.device),
+            )
+        parts: List[Tuple[Tensor, Tensor]] = []
+        d_p, s_p, w_p = self.gather(frontier, table="pos")
+        if d_p.numel():
+            if bool(positive_only):
+                _m = w_p > 0
+            elif bool(negative_only):
+                _m = w_p < 0
+            else:
+                _m = None
+            if _m is not None:
+                d_p, s_p, w_p = d_p[_m], s_p[_m], w_p[_m]
+            if d_p.numel():
+                drv = driver[s_p]
+                if gain is not None:
+                    drv = drv * gain[s_p]
+                parts.append(self._accumulate(d_p, s_p, w_p * drv, num))
+        if not bool(positive_only):
+            d_n, s_n, w_n = self.gather(frontier, table="neg")
+            if d_n.numel():
+                parts.append(self._accumulate(d_n, s_n, w_n * driver[s_n], num))
+        return self._merge(parts)
+
+    def _merge(self, parts: Sequence[Tuple[Tensor, Tensor]]) -> Tuple[Tensor, Tensor]:
+        if not parts:
+            return (
+                torch.zeros(0, dtype=torch.long, device=self.device),
+                torch.zeros(0, dtype=self.values.dtype, device=self.device),
+            )
+        idx = torch.cat([p[0] for p in parts])
+        val = torch.cat([p[1] for p in parts])
+        if len(parts) == 1:
+            return idx, val
+        order = torch.argsort(idx, stable=True)
+        idx, val = idx[order], val[order]
+        uniq, inv = torch.unique_consecutive(idx, return_inverse=True)
+        acc = torch.zeros(int(uniq.numel()), dtype=self.values.dtype, device=self.device)
+        acc.index_add_(0, inv, val)
+        keep = acc != 0
+        return uniq[keep], acc[keep]
+
+    def _accumulate(self, dest: Tensor, src: Tensor, val: Tensor,
+                    num: int) -> Tuple[Tensor, Tensor]:
+        order = torch.argsort(dest * num + src, stable=True)
+        dest, val = dest[order], val[order]
+        uniq, inv = torch.unique_consecutive(dest, return_inverse=True)
+        acc = torch.zeros(int(uniq.numel()), dtype=self.values.dtype, device=self.device)
+        acc.index_add_(0, inv, val)
+        keep = acc != 0
+        return uniq[keep], acc[keep]
 
     @torch.no_grad()
     def merge_edges(
@@ -290,7 +370,7 @@ class LateralState:
             seen = set()
             keep_new = []
             for i in range(dest.numel()):
-                k = (int(dest[i]), int(src[i]))
+                k = (int(src[i]), int(dest[i]))
                 if k in have or k in seen:
                     skipped += 1
                     continue
@@ -299,7 +379,7 @@ class LateralState:
             if not keep_new:
                 return {"created": 0, "skipped_existing": skipped}
             dest, src, vals = dest[keep_new], src[keep_new], vals[keep_new]
-        idx = torch.cat([self.index, torch.stack([dest, src], dim=0)], dim=1)
+        idx = torch.cat([self.index, torch.stack([src, dest], dim=0)], dim=1)
         val = torch.cat([self.values, vals], dim=0)
         wf = torch.cat([self.weak.float(),
                         torch.full((int(vals.numel()),), float(bool(weak)),
@@ -314,6 +394,7 @@ class LateralState:
         self.values = mat.values()
         self.values = self.values.clamp(-self._neg_cap(), self.cfg.max_weight)
         self.weak = wmat.values() > 0
+        self._csr_cache = None
         self._prune_zero()
         self.enforce_degree()
         return {"created": int(dest.numel()), "skipped_existing": int(skipped)}
@@ -360,7 +441,7 @@ class LateralState:
 
         pos = {
             (int(d), int(s)): i
-            for i, (d, s) in enumerate(
+            for i, (s, d) in enumerate(
                 zip(self.index[0].tolist(), self.index[1].tolist())
             )
         }
@@ -369,20 +450,22 @@ class LateralState:
         if int(self.neg_index.numel()):
             npos_map = {
                 (int(d), int(s_)): i
-                for i, (d, s_) in enumerate(
+                for i, (s_, d) in enumerate(
                     zip(self.neg_index[0].tolist(), self.neg_index[1].tolist())
                 )
             }
         hits: List[Tuple[str, int, float, int, float]] = []
         wsum: Dict[int, float] = {}
+        _vals = self.values.tolist()
+        _nvals = self.neg_values.tolist()
         for d, src, pair in edges:
             key = (int(d), int(src))
             if key in pos:
                 p_ = pos[key]
-                hits.append(("pos", p_, float(self.values[p_]), int(d), float(pair)))
+                hits.append(("pos", p_, _vals[p_], int(d), float(pair)))
             elif key in npos_map:
                 p_ = npos_map[key]
-                hits.append(("neg", p_, float(self.neg_values[p_]), int(d), float(pair)))
+                hits.append(("neg", p_, _nvals[p_], int(d), float(pair)))
             else:
                 stats["n_edges_missing"] += 1.0
                 continue
@@ -396,17 +479,29 @@ class LateralState:
         sign_flips = 0.0
         if hits:
             before = torch.cat([self.values, self.neg_values])
-            upd_pos = torch.zeros_like(self.values)
-            upd_neg = torch.zeros_like(self.neg_values)
+            _hp: List[int] = []
+            _hd: List[float] = []
+            _hn: List[int] = []
+            _hnd: List[float] = []
             for tbl, p_, w, dd, pp in hits:
                 tot = wsum[dd]
                 share = (abs(w) / tot) if tot > 0.0 else 0.0
 
                 delta = float(lr) * _mod(dd) * pp * share
                 if tbl == "pos":
-                    upd_pos[p_] += delta
+                    _hp.append(p_)
+                    _hd.append(delta)
                 else:
-                    upd_neg[p_] += delta
+                    _hn.append(p_)
+                    _hnd.append(delta)
+            upd_pos = torch.zeros_like(self.values)
+            upd_neg = torch.zeros_like(self.neg_values)
+            if _hp:
+                upd_pos.index_add_(0, torch.tensor(_hp, dtype=torch.long, device=self.device),
+                                   torch.tensor(_hd, dtype=upd_pos.dtype, device=self.device))
+            if _hn:
+                upd_neg.index_add_(0, torch.tensor(_hn, dtype=torch.long, device=self.device),
+                                   torch.tensor(_hnd, dtype=upd_neg.dtype, device=self.device))
             stats["upd_abs_sum"] = float(upd_pos.abs().sum() + upd_neg.abs().sum())
             self.values = self.values + upd_pos
             self.neg_values = self.neg_values + upd_neg
@@ -431,7 +526,7 @@ class LateralState:
         n_to_neg = 0
         if bool((self.values < 0).any()):
             _mv = self.values < 0
-            _d = self.index[0][_mv]; _s2 = self.index[1][_mv]; _v = self.values[_mv]
+            _d = self.index[1][_mv]; _s2 = self.index[0][_mv]; _v = self.values[_mv]
             n_to_neg = self._neg_merge_add(_d, _s2, _v)
             keep = ~_mv
             self.index = self.index[:, keep]
@@ -440,7 +535,7 @@ class LateralState:
         n_to_pos = 0
         if int(self.neg_values.numel()) and bool((self.neg_values > 0).any()):
             _mv = self.neg_values > 0
-            _d = self.neg_index[0][_mv]; _s2 = self.neg_index[1][_mv]; _v = self.neg_values[_mv]
+            _d = self.neg_index[1][_mv]; _s2 = self.neg_index[0][_mv]; _v = self.neg_values[_mv]
             _keep_n = ~_mv
             self.neg_index = self.neg_index[:, _keep_n]
             self.neg_values = self.neg_values[_keep_n]
@@ -450,13 +545,13 @@ class LateralState:
                 if (int(_dd), int(_ss)) in _keys:
                     _idx = pos.get((int(_dd), int(_ss)))
                     if _idx is None:
-                        _idx = int(((self.index[0] == _dd) & (self.index[1] == _ss)).nonzero()[0, 0])
+                        _idx = int(((self.index[1] == _dd) & (self.index[0] == _ss)).nonzero()[0, 0])
                     self.values[_idx] = self.values[_idx] + float(_vv)
                 else:
                     _new_d.append(int(_dd)); _new_s.append(int(_ss)); _new_v.append(float(_vv))
             if _new_d:
                 self.index = torch.cat([self.index,
-                                        torch.tensor([_new_d, _new_s], dtype=self.index.dtype,
+                                        torch.tensor([_new_s, _new_d], dtype=self.index.dtype,
                                                      device=self.device)], dim=1)
                 self.values = torch.cat([self.values,
                                          torch.tensor(_new_v, dtype=self.values.dtype,
@@ -481,6 +576,8 @@ class LateralState:
                 self.values = self.values[keep]
                 self.weak = self.weak[keep]
             stats["n_dropped"] = float(n)
+        self._csr_cache = None
+        self._neg_csr_cache = None
         return stats
 
     @torch.no_grad()
@@ -585,6 +682,8 @@ class LateralState:
             self.index = self.index[:, keep]
             self.values = self.values[keep]
             self.weak = self.weak[keep]
+        self._csr_cache = None
+        self._neg_csr_cache = None
 
     def enforce_degree(self, max_out_degree: Optional[int] = None) -> None:
         cap = int(self.cfg.max_out_degree if max_out_degree is None else max_out_degree)
@@ -592,7 +691,7 @@ class LateralState:
             return
         rows: Dict[int, List[Tuple[int, int, float, bool]]] = {}
         for s, d, v, wk in zip(
-            self.index[1].tolist(), self.index[0].tolist(),
+            self.index[0].tolist(), self.index[1].tolist(),
             self.values.tolist(), self.weak.tolist()
         ):
             rows.setdefault(int(s), []).append((int(d), int(s), float(v), bool(wk)))
@@ -608,10 +707,11 @@ class LateralState:
                 keep_v.append(v)
                 keep_w.append(wk)
         self.index = torch.tensor(
-            [keep_d, keep_s], dtype=torch.long, device=self.device
+            [keep_s, keep_d], dtype=torch.long, device=self.device
         )
         self.values = torch.tensor(keep_v, dtype=torch.float32, device=self.device)
         self.weak = torch.tensor(keep_w, dtype=torch.bool, device=self.device)
+        self._csr_cache = None
 
 
     def ensure_slots(self, num_slots: int) -> None:
@@ -620,6 +720,8 @@ class LateralState:
         n = int(num_slots)
         if n > int(self._standalone_slots):
             self._standalone_slots = n
+            self._csr_cache = None
+            self._neg_csr_cache = None
 
     def state_dict(self) -> Dict[str, Any]:
         return {
@@ -627,6 +729,7 @@ class LateralState:
             "values": self.values.detach().cpu(),
             "neg_index": self.neg_index.detach().cpu(),
             "neg_values": self.neg_values.detach().cpu(),
+            "edge_order": "src_dest",
             "config": self.cfg.to_json(),
         }
 
@@ -639,9 +742,15 @@ class LateralState:
             if "config" in state
             else LateralConfig()
         )
-        lat = cls(state["index"], state["values"], cfg, node=node)
-        if "neg_index" in state and int(state["neg_index"].shape[1]):
-            lat.neg_index = state["neg_index"].long().to(lat.device)
+        index = state["index"]
+        neg_index = state.get("neg_index")
+        if str(state.get("edge_order", "")) != "src_dest":
+            index = index.flip(0)
+            if neg_index is not None and int(neg_index.shape[1]):
+                neg_index = neg_index.flip(0)
+        lat = cls(index, state["values"], cfg, node=node)
+        if neg_index is not None and int(neg_index.shape[1]):
+            lat.neg_index = neg_index.long().to(lat.device)
             lat.neg_values = state["neg_values"].float().to(lat.device)
         return lat
 
@@ -734,6 +843,9 @@ class SynapticaNode:
             [self.mem, torch.zeros(n_new, dtype=self.mem.dtype, device=self.mem.device)]
         )
         self.output_size = new_size
+        if self.lateral is not None:
+            self.lateral._csr_cache = None
+            self.lateral._neg_csr_cache = None
         return True
 
     def reset(self) -> None:
